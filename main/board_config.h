@@ -122,3 +122,15 @@
 #ifndef BSP_CAL_WEIGHT_GRAMS
 #define BSP_CAL_WEIGHT_GRAMS         500.0f
 #endif
+
+// H6.1: post-tap settling delay before TARE/CAL sample collection begins.
+// The screen is mechanically coupled to the load cell, so a finger press
+// on the TARE / CAL button briefly biases the reading.  The owner task
+// reads-and-discards for this many milliseconds (keeping the cache live
+// so the UI doesn't freeze) before starting the actual averaging window.
+#ifndef BSP_TARE_SETTLE_MS
+#define BSP_TARE_SETTLE_MS           1000
+#endif
+#ifndef BSP_CAL_SETTLE_MS
+#define BSP_CAL_SETTLE_MS            1000
+#endif

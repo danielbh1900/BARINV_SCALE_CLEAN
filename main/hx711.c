@@ -79,6 +79,28 @@ static volatile bool    s_cal_in_progress  = false;
 #define HX711_CAL_SAMPLES       16
 #define HX711_CAL_MIN_ABS_NET   1000           /* reject if |avg_net| below */
 
+/* H6.1: read-and-discard for `settle_ms` while keeping the cache
+ * (raw / net / grams) live.  Used as a finger-release window before
+ * TARE/CAL sample collection — the screen is mechanically coupled to
+ * the load cell, so the few hundred ms of finger pressure on the button
+ * would otherwise contaminate the average.  Each iteration is one
+ * normal HX711 read (~100 ms), so ~10 reads in 1000 ms.  Cache stays
+ * live so the UI's "raw / zero" line keeps ticking. */
+static void hx711_settle(uint32_t settle_ms) {
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(settle_ms);
+    while (xTaskGetTickCount() < deadline) {
+        int32_t s;
+        if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
+        int32_t cur_net = s - s_tare_offset;
+        float   cur_g   = s_cal_valid ? ((float)cur_net / s_cal_factor) : 0.0f;
+        portENTER_CRITICAL(&s_cache_mux);
+        s_latest_raw   = s;
+        s_latest_net   = cur_net;
+        s_latest_grams = cur_g;
+        portEXIT_CRITICAL(&s_cache_mux);
+    }
+}
+
 static inline int gain_total_pulses(hx711_gain_t g) {
     switch (g) {
         case HX711_GAIN_128_A: return 25;
@@ -270,8 +292,11 @@ static void hx711_task(void *arg) {
         if (xTaskNotifyWait(0, ULONG_MAX, &notif, 0) == pdPASS) {
             if (notif & HX711_NOTIFY_TARE_BIT) {
                 s_tare_in_progress = true;
-                ESP_LOGI(TAG, "TARE requested — collecting %d samples for "
-                              "averaging...", HX711_TARE_SAMPLES);
+                ESP_LOGI(TAG, "TARE requested — release scale, settling "
+                              "%d ms...", BSP_TARE_SETTLE_MS);
+                hx711_settle(BSP_TARE_SETTLE_MS);
+                ESP_LOGI(TAG, "TARE: collecting %d samples for averaging...",
+                              HX711_TARE_SAMPLES);
                 int64_t sum = 0;
                 int     n   = 0;
                 for (int i = 0; i < HX711_TARE_SAMPLES; ++i) {
@@ -312,8 +337,12 @@ static void hx711_task(void *arg) {
             if (notif & HX711_NOTIFY_CAL_BIT) {
                 s_cal_in_progress = true;
                 float known = s_cal_known_grams;
-                ESP_LOGI(TAG, "CAL requested — known_weight=%.1fg, collecting "
-                              "%d samples...", (double)known, HX711_CAL_SAMPLES);
+                ESP_LOGI(TAG, "CAL requested — known_weight=%.1fg, release "
+                              "button, settling %d ms...",
+                              (double)known, BSP_CAL_SETTLE_MS);
+                hx711_settle(BSP_CAL_SETTLE_MS);
+                ESP_LOGI(TAG, "CAL: collecting %d samples for averaging...",
+                              HX711_CAL_SAMPLES);
                 int64_t sum_net = 0;
                 int     n       = 0;
                 for (int i = 0; i < HX711_CAL_SAMPLES; ++i) {
