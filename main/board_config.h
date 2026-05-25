@@ -134,3 +134,20 @@
 #ifndef BSP_CAL_SETTLE_MS
 #define BSP_CAL_SETTLE_MS            1000
 #endif
+
+// H7.1: boot auto-tare.  Mirrors commercial kitchen-scale behavior — the
+// scale wakes up showing zero so the operator can just start weighing.
+// Runs ONCE at owner-task startup, RAM-only (never written to NVS),
+// blocks no other subsystem.  If an object is already on the platform at
+// power-on, that object's weight becomes the new zero (same trade-off as
+// most commercial scales).  No object-presence detection is performed
+// here; that would be a later (H8+) addition only if needed.
+#ifndef BSP_BOOT_AUTOTARE_ENABLE
+#define BSP_BOOT_AUTOTARE_ENABLE     1
+#endif
+#ifndef BSP_BOOT_AUTOTARE_SETTLE_MS
+#define BSP_BOOT_AUTOTARE_SETTLE_MS  2000   // HX711 post-power-on settle
+#endif
+#ifndef BSP_BOOT_AUTOTARE_SAMPLES
+#define BSP_BOOT_AUTOTARE_SAMPLES    16
+#endif

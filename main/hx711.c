@@ -87,6 +87,12 @@ static volatile float   s_cal_known_grams  = 0.0f;   /* set by request fn */
 static volatile bool    s_tare_in_progress = false;
 static volatile bool    s_cal_in_progress  = false;
 
+/* H7.1: boot auto-tare guard.  True from the moment the owner task
+ * starts until the boot auto-tare completes (or is skipped).  Manual
+ * TARE/CAL requests during this window are rejected with a distinct
+ * "boot auto-tare in progress" log line. */
+static volatile bool    s_boot_autotare_in_progress = false;
+
 #define HX711_NOTIFY_CAL_BIT    (1u << 1)
 #define HX711_CAL_SAMPLES       16
 #define HX711_CAL_MIN_ABS_NET   1000           /* reject if |avg_net| below */
@@ -334,6 +340,58 @@ static void hx711_task(void *arg) {
              (int)xPortGetCoreID(),
              s_sck, s_dout, (int)BSP_HX711_SWAP_PINS);
 
+#if BSP_BOOT_AUTOTARE_ENABLE
+    /* H7.1: boot auto-tare.  COMMERCIAL-SCALE NOTE: this assumes the
+     * platform is empty at boot.  If an object is on the platform during
+     * boot, that object becomes the new zero — same as many commercial
+     * kitchen scales.  RAM-only; never written to NVS.  Runs once as
+     * the first action of the owner task, before any notifications are
+     * checked, so it cannot collide with manual TARE/CAL. */
+    s_boot_autotare_in_progress = true;
+    ESP_LOGI(TAG, "BOOT auto-tare — settling %d ms...",
+             BSP_BOOT_AUTOTARE_SETTLE_MS);
+    hx711_settle(BSP_BOOT_AUTOTARE_SETTLE_MS);
+    ESP_LOGI(TAG, "BOOT auto-tare: collecting %d samples...",
+             BSP_BOOT_AUTOTARE_SAMPLES);
+    {
+        int64_t bt_sum = 0;
+        int     bt_n   = 0;
+        for (int i = 0; i < BSP_BOOT_AUTOTARE_SAMPLES; ++i) {
+            int32_t s;
+            if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
+            int32_t cur_net = s - s_tare_offset;
+            float   cur_g   = s_cal_valid
+                              ? ((float)cur_net / s_cal_factor) : 0.0f;
+            portENTER_CRITICAL(&s_cache_mux);
+            s_latest_raw   = s;
+            s_latest_net   = cur_net;
+            s_latest_grams = cur_g;
+            portEXIT_CRITICAL(&s_cache_mux);
+            bt_sum += s;
+            bt_n++;
+        }
+        if (bt_n > 0) {
+            int32_t new_offset = (int32_t)(bt_sum / bt_n);
+            int32_t new_net    = s_latest_raw - new_offset;
+            float   new_g      = s_cal_valid
+                                 ? ((float)new_net / s_cal_factor) : 0.0f;
+            portENTER_CRITICAL(&s_cache_mux);
+            s_tare_offset  = new_offset;
+            s_latest_net   = new_net;
+            s_latest_grams = new_g;
+            portEXIT_CRITICAL(&s_cache_mux);
+            s_have_sample = true;
+            ESP_LOGI(TAG, "BOOT auto-tare applied: tare_offset=%ld "
+                          "(avg of %d samples)",
+                     (long)new_offset, bt_n);
+        } else {
+            ESP_LOGW(TAG, "BOOT auto-tare failed: zero successful samples "
+                          "— continuing without tare (user can press TARE)");
+        }
+    }
+    s_boot_autotare_in_progress = false;
+#endif
+
     for (;;) {
         int  dout_pre = gpio_get_level(s_dout);
         bool ready    = (dout_pre == 0);
@@ -542,6 +600,10 @@ bool hx711_get_snapshot_full(int32_t *out_raw, int32_t *out_net,
 
 esp_err_t hx711_request_tare(void) {
     if (!s_task_started || s_owner_task == NULL) return ESP_ERR_INVALID_STATE;
+    if (s_boot_autotare_in_progress) {
+        ESP_LOGW(TAG, "TARE ignored — boot auto-tare in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (s_tare_in_progress || s_cal_in_progress) {
         ESP_LOGW(TAG, "TARE ignored — already in progress");
         return ESP_ERR_INVALID_STATE;
@@ -553,6 +615,10 @@ esp_err_t hx711_request_tare(void) {
 esp_err_t hx711_request_calibrate(float known_grams) {
     if (!s_task_started || s_owner_task == NULL) return ESP_ERR_INVALID_STATE;
     if (known_grams <= 0.0f) return ESP_ERR_INVALID_ARG;
+    if (s_boot_autotare_in_progress) {
+        ESP_LOGW(TAG, "CAL ignored — boot auto-tare in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (s_tare_in_progress || s_cal_in_progress) {
         ESP_LOGW(TAG, "CAL ignored — already in progress");
         return ESP_ERR_INVALID_STATE;
