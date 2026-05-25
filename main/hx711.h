@@ -106,14 +106,20 @@ esp_err_t hx711_request_calibrate(float known_grams);
 //   net  := raw - tare_offset  (== raw before the first TARE)
 bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net);
 
-// H6 — full snapshot including calibrated grams.
+// H6 + H8 — full snapshot including filtered grams and stability flag.
 //   *out_raw         := last successful raw reading
 //   *out_net         := raw - tare_offset
-//   *out_grams       := net / cal_factor   (valid only if *out_cal_valid)
+//   *out_grams       := H8 filtered grams (outlier-rejected + EMA-smoothed).
+//                       Valid only if *out_cal_valid.  This is the value
+//                       intended for on-screen display.
 //   *out_cal_valid   := true iff calibration has been completed at least
 //                       once since boot
+//   *out_stable      := H8 stability flag — true when the last N filtered
+//                       samples are within BSP_STABLE_THRESHOLD_GRAMS of
+//                       each other
 // Any out pointer may be NULL.  Returns true if at least one sample has
 // been captured since boot.  All fields are read under the per-core
-// portMUX so the (raw, net, grams, cal_valid) tuple is self-consistent.
+// portMUX so the tuple is self-consistent.
 bool hx711_get_snapshot_full(int32_t *out_raw, int32_t *out_net,
-                              float *out_grams, bool *out_cal_valid);
+                              float *out_grams, bool *out_cal_valid,
+                              bool *out_stable);

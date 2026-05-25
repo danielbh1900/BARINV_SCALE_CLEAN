@@ -61,25 +61,27 @@ static void on_cal_clicked(lv_event_t *e) {
     }
 }
 
-/* H4 + H5 + H6: LVGL timer callback — pulls the full HX711 snapshot
- * (raw, net, grams, cal_valid) atomically and refreshes both labels.
- * No I/O, no protocol, no GPIO — pure cache reads.  Runs from inside
- * lv_timer_handler so the LVGL port lock is already held. */
+/* H4 + H5 + H6 + H8: LVGL timer callback — pulls the full HX711 snapshot
+ * (raw, net, filtered grams, cal_valid, stable) atomically and refreshes
+ * the labels.  No I/O, no protocol, no GPIO — pure cache reads.  Runs
+ * from inside lv_timer_handler so the LVGL port lock is already held. */
 static void ui_poll_raw_cb(lv_timer_t *t) {
     (void)t;
-    if (s_raw_lbl == NULL || s_weight_lbl == NULL || s_unit_lbl == NULL) return;
+    if (s_raw_lbl == NULL || s_weight_lbl == NULL || s_unit_lbl == NULL ||
+        s_stable_lbl == NULL) return;
 
     int32_t raw  = 0;
     int32_t net  = 0;
     float   grams = 0.0f;
     bool    cal_valid = false;
-    if (!hx711_get_snapshot_full(&raw, &net, &grams, &cal_valid)) return;
+    bool    stable    = false;
+    if (!hx711_get_snapshot_full(&raw, &net, &grams, &cal_valid, &stable)) return;
 
     /* Bottom debug line — always shows the underlying counts. */
     lv_label_set_text_fmt(s_raw_lbl, "raw: %ld / zero: %ld",
                           (long)raw, (long)net);
 
-    /* Large weight display. */
+    /* Large weight display (uses filtered grams from H8). */
     if (!cal_valid) {
         lv_label_set_text(s_weight_lbl, "----");
         lv_label_set_text(s_unit_lbl,   "g");
@@ -89,6 +91,19 @@ static void ui_poll_raw_cb(lv_timer_t *t) {
     } else {
         lv_label_set_text_fmt(s_weight_lbl, "%.3f", (double)grams / 1000.0);
         lv_label_set_text(s_unit_lbl, "kg");
+    }
+
+    /* H8: stability indicator — green STABLE when steady, gray --- when
+     * settling.  Hidden ("---" gray) until calibration is loaded. */
+    if (!cal_valid) {
+        lv_label_set_text(s_stable_lbl, "---");
+        lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x808080), 0);
+    } else if (stable) {
+        lv_label_set_text(s_stable_lbl, "STABLE");
+        lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x4CAF50), 0);
+    } else {
+        lv_label_set_text(s_stable_lbl, "---");
+        lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x808080), 0);
     }
 }
 
