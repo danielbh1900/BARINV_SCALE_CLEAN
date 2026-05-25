@@ -105,7 +105,7 @@
 //  BSP_HX711_SWAP_PINS=1 in sdkconfig.defaults or via -D at build time —
 //  no source edit required.
 #ifndef BSP_HX711_SWAP_PINS
-#define BSP_HX711_SWAP_PINS          0
+#define BSP_HX711_SWAP_PINS          1
 #endif
 #if BSP_HX711_SWAP_PINS
   #define BSP_HX711_SCK              44

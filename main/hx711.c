@@ -150,9 +150,14 @@ esp_err_t hx711_set_gain_next(hx711_gain_t g) {
  * ------------------------------------------------------------------------ */
 static void hx711_task(void *arg) {
     (void)arg;
-    int32_t raw = 0;
-    ESP_LOGI(TAG, "owner task running on core %d @ ~10 Hz (raw-only)",
-             (int)xPortGetCoreID());
+    int32_t  raw           = 0;
+    int32_t  prev_raw      = 0x7FFFFFFF;   /* impossible 24-bit value */
+    uint32_t stuck_count   = 0;            /* consecutive identical reads */
+    ESP_LOGI(TAG, "owner task running on core %d @ ~10 Hz "
+                  "(raw-only, SCK=GPIO%d DOUT=GPIO%d, BSP_HX711_SWAP_PINS=%d)",
+             (int)xPortGetCoreID(),
+             s_sck, s_dout, (int)BSP_HX711_SWAP_PINS);
+
     for (;;) {
         int  dout_pre = gpio_get_level(s_dout);
         bool ready    = (dout_pre == 0);
@@ -161,12 +166,30 @@ static void hx711_task(void *arg) {
         if (r == ESP_OK) {
             ESP_LOGI(TAG, "raw=%ld  dout=%d  ready=%d",
                      (long)raw, dout_pre, (int)ready);
+
+            /* Stuck-value detection (H3 observability): warn loudly every
+             * ~2 s if every read returns the same value AND it's one of
+             * the obvious failure sentinels (0 or -1 = 0xFFFFFF). */
+            if (raw == prev_raw) {
+                if (++stuck_count == 20 && (raw == 0 || raw == -1)) {
+                    ESP_LOGW(TAG, "STUCK: raw=%ld for %u consecutive reads "
+                                  "(~2 s). SCK/DOUT wiring or HX711 power "
+                                  "likely wrong — current mapping SCK=GPIO%d "
+                                  "DOUT=GPIO%d (BSP_HX711_SWAP_PINS=%d).",
+                             (long)raw, (unsigned)stuck_count,
+                             s_sck, s_dout, (int)BSP_HX711_SWAP_PINS);
+                }
+            } else {
+                stuck_count = 0;
+                prev_raw    = raw;
+            }
         } else if (r == ESP_ERR_TIMEOUT) {
             int dout_now = gpio_get_level(s_dout);
             ESP_LOGW(TAG, "TIMEOUT  dout=%d (stuck %s) — HX711 not asserting "
-                          "DRDY; check 3.3 V / GND, wiring, or set "
-                          "BSP_HX711_SWAP_PINS=1 (H3)",
-                     dout_now, dout_now ? "HIGH" : "LOW");
+                          "DRDY; check 3.3 V / GND, wiring (current SCK=GPIO%d "
+                          "DOUT=GPIO%d, SWAP=%d)",
+                     dout_now, dout_now ? "HIGH" : "LOW",
+                     s_sck, s_dout, (int)BSP_HX711_SWAP_PINS);
         } else {
             ESP_LOGE(TAG, "read error: %s", esp_err_to_name(r));
         }
