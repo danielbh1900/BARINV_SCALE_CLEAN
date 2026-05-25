@@ -27,6 +27,18 @@
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 
+/* H7: NVS persistence for calibration only.  TARE stays RAM-only — load
+ * cell zero drifts with temperature / mounting, so it must be a user
+ * action after every boot. */
+#include "nvs.h"
+
+#define HX711_NVS_NAMESPACE     "barinv_scale"
+#define HX711_NVS_K_VERSION     "cal_ver"
+#define HX711_NVS_K_VALID       "cal_valid"
+#define HX711_NVS_K_FACTOR      "cal_factor"
+#define HX711_NVS_K_KNOWN       "cal_known"
+#define HX711_NVS_SCHEMA_VER    1u
+
 static const char *TAG = "hx711";
 
 static int          s_sck          = -1;
@@ -78,6 +90,104 @@ static volatile bool    s_cal_in_progress  = false;
 #define HX711_NOTIFY_CAL_BIT    (1u << 1)
 #define HX711_CAL_SAMPLES       16
 #define HX711_CAL_MIN_ABS_NET   1000           /* reject if |avg_net| below */
+
+/* H7: load saved calibration from NVS into RAM cache.  Called from
+ * hx711_owner_start BEFORE the owner task spawns so the very first
+ * sample produces meaningful grams.  Any failure path leaves the
+ * cache uncalibrated (s_cal_valid=false) — the app keeps booting and
+ * the UI shows "----" until a fresh CAL is performed. */
+static esp_err_t cal_load_from_nvs(void) {
+    nvs_handle_t h;
+    esp_err_t r = nvs_open(HX711_NVS_NAMESPACE, NVS_READONLY, &h);
+    if (r != ESP_OK) {
+        if (r == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(TAG, "no NVS calibration namespace yet — uncalibrated");
+        } else {
+            ESP_LOGW(TAG, "nvs_open (read) failed: %s — uncalibrated",
+                     esp_err_to_name(r));
+        }
+        return r;
+    }
+
+    uint8_t ver = 0;
+    if (nvs_get_u8(h, HX711_NVS_K_VERSION, &ver) != ESP_OK
+            || ver != HX711_NVS_SCHEMA_VER) {
+        ESP_LOGI(TAG, "no compatible NVS calibration (schema_ver=%u, "
+                      "expected %u) — uncalibrated",
+                 (unsigned)ver, (unsigned)HX711_NVS_SCHEMA_VER);
+        nvs_close(h);
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    uint8_t valid = 0;
+    if (nvs_get_u8(h, HX711_NVS_K_VALID, &valid) != ESP_OK || valid != 1) {
+        ESP_LOGI(TAG, "NVS calibration cleared (cal_valid=0) — uncalibrated");
+        nvs_close(h);
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+
+    float factor = 0.0f, known = 0.0f;
+    size_t sz = sizeof(float);
+    if (nvs_get_blob(h, HX711_NVS_K_FACTOR, &factor, &sz) != ESP_OK
+            || sz != sizeof(float)) {
+        ESP_LOGW(TAG, "NVS cal_factor missing/corrupt — uncalibrated");
+        nvs_close(h);
+        return ESP_FAIL;
+    }
+    sz = sizeof(float);
+    if (nvs_get_blob(h, HX711_NVS_K_KNOWN, &known, &sz) != ESP_OK
+            || sz != sizeof(float)) {
+        ESP_LOGW(TAG, "NVS cal_known missing/corrupt — uncalibrated");
+        nvs_close(h);
+        return ESP_FAIL;
+    }
+    nvs_close(h);
+
+    if (factor == 0.0f) {
+        ESP_LOGW(TAG, "NVS cal_factor=0 — would div by zero — uncalibrated");
+        return ESP_FAIL;
+    }
+
+    /* Apply to the RAM cache.  No mux needed: owner task isn't running
+     * yet, no readers can race us. */
+    s_cal_factor      = factor;
+    s_cal_valid       = true;
+    s_cal_known_grams = known;
+    ESP_LOGI(TAG, "calibration loaded from NVS: factor=%.4f counts/g, "
+                  "known=%.1fg (schema v%u)",
+             (double)factor, (double)known, (unsigned)HX711_NVS_SCHEMA_VER);
+    return ESP_OK;
+}
+
+/* H7: persist the just-applied calibration.  Called by the CAL handler
+ * after a successful RAM apply.  All keys are written then nvs_commit;
+ * partial writes never become observable.  Failure is logged loudly but
+ * never crashes the app — the RAM calibration is still active for the
+ * current session, it just won't survive reboot. */
+static esp_err_t cal_save_to_nvs(float factor, float known) {
+    nvs_handle_t h;
+    esp_err_t r = nvs_open(HX711_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open (rw) failed: %s — calibration in RAM only",
+                 esp_err_to_name(r));
+        return r;
+    }
+    esp_err_t e = ESP_OK;
+    if (e == ESP_OK) e = nvs_set_u8  (h, HX711_NVS_K_VERSION, HX711_NVS_SCHEMA_VER);
+    if (e == ESP_OK) e = nvs_set_u8  (h, HX711_NVS_K_VALID,   1);
+    if (e == ESP_OK) e = nvs_set_blob(h, HX711_NVS_K_FACTOR,  &factor, sizeof(float));
+    if (e == ESP_OK) e = nvs_set_blob(h, HX711_NVS_K_KNOWN,   &known,  sizeof(float));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "calibration saved to NVS: factor=%.4f counts/g, "
+                      "known=%.1fg", (double)factor, (double)known);
+    } else {
+        ESP_LOGE(TAG, "calibration save FAILED: %s — RAM only this boot",
+                 esp_err_to_name(e));
+    }
+    return e;
+}
 
 /* H6.1: read-and-discard for `settle_ms` while keeping the cache
  * (raw / net / grams) live.  Used as a finger-release window before
@@ -388,6 +498,10 @@ static void hx711_task(void *arg) {
                                       "known=%.1fg)",
                                  (double)new_factor, (long long)avg_net, n,
                                  (double)known);
+                        /* H7: persist immediately so a reboot restores
+                         * the calibration.  Failure logs but does not
+                         * disturb the live RAM cal. */
+                        (void)cal_save_to_nvs(new_factor, known);
                     }
                 }
                 s_cal_in_progress = false;
@@ -451,6 +565,11 @@ esp_err_t hx711_request_calibrate(float known_grams) {
 esp_err_t hx711_owner_start(void) {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
     if (s_task_started) return ESP_OK;
+
+    /* H7: load saved calibration (if any) BEFORE the task spawns so the
+     * very first cached sample already has correct grams.  Soft-failure:
+     * any error path simply leaves us uncalibrated.  Never blocks boot. */
+    (void)cal_load_from_nvs();
 
     BaseType_t ok = xTaskCreatePinnedToCore(
         hx711_task,
