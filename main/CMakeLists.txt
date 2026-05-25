@@ -8,6 +8,7 @@ idf_component_register(
         "st7701_panel.c"
         "cst820_touch.c"
         "lvgl_glue.c"
+        "hx711.c"
     INCLUDE_DIRS
         "."
     REQUIRES

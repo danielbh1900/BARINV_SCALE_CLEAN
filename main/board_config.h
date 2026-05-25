@@ -95,3 +95,22 @@
 
 // ---- Buzzer (LATER; on/off only via TCA9554 EXIO8) ------------------------
 #define BSP_BUZZER_VIA_EXIO_BIT      8
+
+// ---- HX711 24-bit ADC (Phase 2; bit-bang via GPIO, no SPI peripheral) -----
+//  Console is on native USB-Serial-JTAG (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y,
+//  USB_CDC=n), so the default UART0 TX=GPIO43 / RX=GPIO44 pins are NOT taken
+//  by the console and are free for the HX711.
+//  Default mapping mirrors the standalone HX711_SCALE_LAB project.
+//  If SCK/DOUT turn out reversed on the assembled hardware, define
+//  BSP_HX711_SWAP_PINS=1 in sdkconfig.defaults or via -D at build time —
+//  no source edit required.
+#ifndef BSP_HX711_SWAP_PINS
+#define BSP_HX711_SWAP_PINS          0
+#endif
+#if BSP_HX711_SWAP_PINS
+  #define BSP_HX711_SCK              44
+  #define BSP_HX711_DOUT             43
+#else
+  #define BSP_HX711_SCK              43
+  #define BSP_HX711_DOUT             44
+#endif
