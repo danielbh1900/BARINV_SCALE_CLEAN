@@ -1,0 +1,13 @@
+## BARINV Scale Clean — managed-component dependencies.
+##
+## The patched copy of espressif__esp_lvgl_port lives in /components and
+## overrides the registry one. Versions below are the proven set from the
+## last screen-working build.
+dependencies:
+  idf: ">=5.1"
+  lvgl/lvgl: "~8.3.0"
+  espressif/esp_lvgl_port: "~1.4.0"
+  espressif/esp_lcd_st7701: "~1.0.0"
+  espressif/esp_lcd_panel_io_additions: "^1"
+  espressif/esp_lcd_touch_cst816s: "~1.0.0"
+  espressif/esp_io_expander_tca9554: "~1.0.0"
