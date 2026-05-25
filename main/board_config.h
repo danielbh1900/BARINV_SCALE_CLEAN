@@ -151,3 +151,54 @@
 #ifndef BSP_BOOT_AUTOTARE_SAMPLES
 #define BSP_BOOT_AUTOTARE_SAMPLES    16
 #endif
+
+// H8: weight-display filter (outlier reject + EMA + stability window).
+//   * Outlier reject compares each new grams sample to the LAST ACCEPTED
+//     raw sample (not the EMA) — this avoids the catch-up starvation
+//     where a converging EMA keeps every fresh sample looking like an
+//     outlier.  An isolated spike >threshold is ignored; a persistent
+//     change (≥2 consecutive over-threshold samples) is accepted.
+//   * EMA(alpha) smooths the accepted samples.  alpha=0.4 → 90% in
+//     ~5 samples (~500 ms at 10 Hz).
+//   * Stability window stores the last N filtered samples; STABLE goes
+//     true when max-min < threshold across the full window.  After
+//     TARE/CAL/auto-tare, the window is pre-filled with the new zero
+//     so STABLE returns true immediately.
+#ifndef BSP_STABLE_WINDOW_SAMPLES
+#define BSP_STABLE_WINDOW_SAMPLES    8
+#endif
+#ifndef BSP_STABLE_THRESHOLD_GRAMS
+#define BSP_STABLE_THRESHOLD_GRAMS   3.0f   /* H8.1: bumped from 2.0 for noise */
+#endif
+#ifndef BSP_OUTLIER_THRESHOLD_GRAMS
+#define BSP_OUTLIER_THRESHOLD_GRAMS  80.0f
+#endif
+#ifndef BSP_FILTER_EMA_ALPHA
+#define BSP_FILTER_EMA_ALPHA         0.4f
+#endif
+
+// H8.1: step-confirmation gate.  When a sample crosses the outlier
+// threshold, it is held as a pending candidate.  Only after
+// BSP_STEP_CONFIRM_SAMPLES additional consecutive samples are within
+// BSP_STEP_CONFIRM_THRESHOLD_GRAMS of the (running-averaged) candidate
+// do we accept it as a real step.  This rejects 1- AND 2-sample
+// glitches (the previous H8 logic only rejected 1-sample glitches).
+// Total accept latency = 1 pending + N confirmations = 200-300 ms.
+#ifndef BSP_STEP_CONFIRM_THRESHOLD_GRAMS
+#define BSP_STEP_CONFIRM_THRESHOLD_GRAMS  25.0f
+#endif
+#ifndef BSP_STEP_CONFIRM_SAMPLES
+#define BSP_STEP_CONFIRM_SAMPLES          2
+#endif
+
+// H8.1: TARE/CAL sample-window quality guards.  Reject the operation
+// if the collection window is too noisy (someone bumped the platform,
+// finger still on screen, weight sliding, etc.).  Span is computed in
+// raw HX711 counts so the same number works whether calibration exists
+// or not.  Previous tare/cal state is preserved on rejection.
+#ifndef BSP_TARE_MAX_SPAN_COUNTS
+#define BSP_TARE_MAX_SPAN_COUNTS     3000
+#endif
+#ifndef BSP_CAL_MAX_SPAN_COUNTS
+#define BSP_CAL_MAX_SPAN_COUNTS      5000
+#endif

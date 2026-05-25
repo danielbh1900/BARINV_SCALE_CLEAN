@@ -27,6 +27,9 @@
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 
+/* H8: floating-point math */
+#include <math.h>
+
 /* H7: NVS persistence for calibration only.  TARE stays RAM-only — load
  * cell zero drifts with temperature / mounting, so it must be a user
  * action after every boot. */
@@ -92,6 +95,136 @@ static volatile bool    s_cal_in_progress  = false;
  * TARE/CAL requests during this window are rejected with a distinct
  * "boot auto-tare in progress" log line. */
 static volatile bool    s_boot_autotare_in_progress = false;
+
+/* H8 + H8.1: display filter state.  All fields are owner-task private —
+ * NOT exposed through the snapshot getter; only the post-filter grams
+ * + stable flag travel through s_cache_mux. */
+static float            s_filter_ema             = 0.0f;
+static float            s_filter_last_accepted   = 0.0f;
+static float            s_filter_window[BSP_STABLE_WINDOW_SAMPLES];
+static int              s_filter_window_idx      = 0;
+static int              s_filter_window_filled   = 0;
+/* H8.1: pending-step candidate (replaces the H8 outlier_streak). */
+static bool             s_step_pending           = false;
+static float            s_step_candidate         = 0.0f;
+static int              s_step_confirm_count     = 0;
+static volatile bool    s_stable                 = false;
+
+static bool filter_window_is_stable(void) {
+    if (s_filter_window_filled < BSP_STABLE_WINDOW_SAMPLES) return false;
+    float lo = s_filter_window[0];
+    float hi = s_filter_window[0];
+    for (int i = 1; i < BSP_STABLE_WINDOW_SAMPLES; ++i) {
+        float v = s_filter_window[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    return (hi - lo) < BSP_STABLE_THRESHOLD_GRAMS;
+}
+
+/* Reset the filter to a known value (after TARE/CAL/auto-tare applies).
+ * Pre-fills the stability window so STABLE returns true immediately for
+ * a steady platform at the new zero.  Also clears any in-flight pending
+ * step candidate. */
+static void filter_reset(float to_grams) {
+    s_filter_ema            = to_grams;
+    s_filter_last_accepted  = to_grams;
+    s_step_pending          = false;
+    s_step_candidate        = 0.0f;
+    s_step_confirm_count    = 0;
+    for (int i = 0; i < BSP_STABLE_WINDOW_SAMPLES; ++i) {
+        s_filter_window[i] = to_grams;
+    }
+    s_filter_window_idx    = 0;
+    s_filter_window_filled = BSP_STABLE_WINDOW_SAMPLES;
+    s_stable               = true;
+}
+
+/* Helper: push an accepted value through the EMA and stability window. */
+static inline float ema_and_push(float accepted) {
+    s_filter_ema = s_filter_ema + BSP_FILTER_EMA_ALPHA * (accepted - s_filter_ema);
+    s_filter_window[s_filter_window_idx] = s_filter_ema;
+    s_filter_window_idx = (s_filter_window_idx + 1) % BSP_STABLE_WINDOW_SAMPLES;
+    if (s_filter_window_filled < BSP_STABLE_WINDOW_SAMPLES) {
+        s_filter_window_filled++;
+    }
+    return s_filter_ema;
+}
+
+/* H8.1 — Process one raw post-calibration grams sample.  Pipeline:
+ *
+ *   1. delta = |new - last_accepted_raw|
+ *   2. If delta <= OUTLIER_THRESHOLD: normal path — accept the sample
+ *      directly, EMA-smooth, push into stability window.
+ *   3. If delta > OUTLIER_THRESHOLD AND no pending candidate: mark
+ *      this sample as the pending candidate.  Hold display.  Force
+ *      stable=false (transition starting).
+ *   4. If a pending candidate exists and new sample is within
+ *      STEP_CONFIRM_THRESHOLD of the (running-averaged) candidate:
+ *      increment confirm count, refine candidate.  Once confirm count
+ *      reaches STEP_CONFIRM_SAMPLES, accept the candidate as a step
+ *      change — EMA jumps toward it, push into window.
+ *   5. If a pending candidate exists and new sample is far from both
+ *      last_accepted AND candidate: glitch path — drop pending, hold
+ *      display.  Next normal-delta sample resumes the normal flow.
+ *
+ * While pending or holding, *out_stable is forced false so the STABLE
+ * indicator does not stay green through a real transition. */
+static float filter_step(float new_grams, bool *out_stable) {
+    float delta = fabsf(new_grams - s_filter_last_accepted);
+
+    if (delta <= BSP_OUTLIER_THRESHOLD_GRAMS) {
+        /* Normal flow — clear any pending candidate, accept sample. */
+        s_step_pending       = false;
+        s_step_confirm_count = 0;
+        s_filter_last_accepted = new_grams;
+        float ema = ema_and_push(new_grams);
+        *out_stable = filter_window_is_stable();
+        return ema;
+    }
+
+    /* delta > OUTLIER — pending-candidate machinery. */
+    if (!s_step_pending) {
+        /* First suspicious sample — start a candidate. */
+        s_step_pending       = true;
+        s_step_candidate     = new_grams;
+        s_step_confirm_count = 0;
+        *out_stable = false;          /* transition starting */
+        return s_filter_ema;          /* hold display */
+    }
+
+    /* Already have a candidate from a previous cycle — does this sample
+     * agree with it? */
+    float confirm_delta = fabsf(new_grams - s_step_candidate);
+    if (confirm_delta <= BSP_STEP_CONFIRM_THRESHOLD_GRAMS) {
+        s_step_confirm_count++;
+        /* Refine candidate with a running mean across pending+confirms. */
+        s_step_candidate =
+            (s_step_candidate * (float)s_step_confirm_count + new_grams) /
+            (float)(s_step_confirm_count + 1);
+        if (s_step_confirm_count >= BSP_STEP_CONFIRM_SAMPLES) {
+            /* Confirmed step — accept the running-averaged candidate. */
+            s_filter_last_accepted = s_step_candidate;
+            s_step_pending         = false;
+            s_step_confirm_count   = 0;
+            float ema = ema_and_push(s_filter_last_accepted);
+            *out_stable = filter_window_is_stable();
+            return ema;
+        }
+        /* Still need more confirmations — continue holding. */
+        *out_stable = false;
+        return s_filter_ema;
+    }
+
+    /* New sample agrees with NEITHER last_accepted (delta > OUTLIER) NOR
+     * the pending candidate — most likely a different glitch sample.
+     * Drop pending, hold display, stay not-stable.  Next sample restarts
+     * the gate fresh. */
+    s_step_pending       = false;
+    s_step_confirm_count = 0;
+    *out_stable = false;
+    return s_filter_ema;
+}
 
 #define HX711_NOTIFY_CAL_BIT    (1u << 1)
 #define HX711_CAL_SAMPLES       16
@@ -375,10 +508,14 @@ static void hx711_task(void *arg) {
             int32_t new_net    = s_latest_raw - new_offset;
             float   new_g      = s_cal_valid
                                  ? ((float)new_net / s_cal_factor) : 0.0f;
+            /* H8: anchor filter at 0 so the boot platform shows STABLE
+             * 0 g immediately when cal is loaded. */
+            filter_reset(new_g);
             portENTER_CRITICAL(&s_cache_mux);
             s_tare_offset  = new_offset;
             s_latest_net   = new_net;
             s_latest_grams = new_g;
+            s_stable       = true;
             portEXIT_CRITICAL(&s_cache_mux);
             s_have_sample = true;
             ESP_LOGI(TAG, "BOOT auto-tare applied: tare_offset=%ld "
@@ -398,14 +535,19 @@ static void hx711_task(void *arg) {
 
         esp_err_t r = hx711_read_raw_blocking(&raw, 200);
         if (r == ESP_OK) {
-            /* H4 + H5 + H6: publish (raw, net, grams) atomically before
-             * logging.  Grams is computed iff calibration is valid. */
-            int32_t net = raw - s_tare_offset;
-            float   g   = s_cal_valid ? ((float)net / s_cal_factor) : 0.0f;
+            /* H4 + H5 + H6 + H8: compute raw post-cal grams, then push
+             * through the H8 filter pipeline to get the value that goes
+             * on screen.  Publish (raw, net, filtered_grams, stable)
+             * atomically. */
+            int32_t net    = raw - s_tare_offset;
+            float   g_raw  = s_cal_valid ? ((float)net / s_cal_factor) : 0.0f;
+            bool    st     = false;
+            float   g_filt = s_cal_valid ? filter_step(g_raw, &st) : 0.0f;
             portENTER_CRITICAL(&s_cache_mux);
             s_latest_raw   = raw;
             s_latest_net   = net;
-            s_latest_grams = g;
+            s_latest_grams = g_filt;
+            s_stable       = st;
             portEXIT_CRITICAL(&s_cache_mux);
             s_have_sample = true;
 
@@ -414,10 +556,10 @@ static void hx711_task(void *arg) {
              * Every 10th read = once per second at 10 Hz cadence. */
             if (++serial_log_counter >= 10) {
                 if (s_cal_valid) {
-                    ESP_LOGI(TAG, "raw=%ld  net=%ld  grams=%.1f  "
-                                  "dout=%d ready=%d",
-                             (long)raw, (long)net, (double)g,
-                             dout_pre, (int)ready);
+                    ESP_LOGI(TAG, "raw=%ld  net=%ld  g_raw=%.1f  g_filt=%.1f  "
+                                  "stable=%d  dout=%d ready=%d",
+                             (long)raw, (long)net, (double)g_raw,
+                             (double)g_filt, (int)st, dout_pre, (int)ready);
                 } else {
                     ESP_LOGI(TAG, "raw=%ld  net=%ld  dout=%d ready=%d "
                                   "(not calibrated)",
@@ -467,6 +609,8 @@ static void hx711_task(void *arg) {
                               HX711_TARE_SAMPLES);
                 int64_t sum = 0;
                 int     n   = 0;
+                int32_t tare_min = INT32_MAX;
+                int32_t tare_max = INT32_MIN;
                 for (int i = 0; i < HX711_TARE_SAMPLES; ++i) {
                     int32_t s;
                     if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
@@ -482,22 +626,42 @@ static void hx711_task(void *arg) {
                     portEXIT_CRITICAL(&s_cache_mux);
                     sum += s;
                     n++;
+                    if (s < tare_min) tare_min = s;
+                    if (s > tare_max) tare_max = s;
                 }
-                if (n > 0) {
-                    int32_t new_offset = (int32_t)(sum / n);
-                    int32_t new_net    = s_latest_raw - new_offset;
-                    float   new_g      = s_cal_valid
-                                         ? ((float)new_net / s_cal_factor) : 0.0f;
-                    portENTER_CRITICAL(&s_cache_mux);
-                    s_tare_offset  = new_offset;
-                    s_latest_net   = new_net;
-                    s_latest_grams = new_g;
-                    portEXIT_CRITICAL(&s_cache_mux);
-                    ESP_LOGI(TAG, "TARE applied: tare_offset=%ld "
-                                  "(avg of %d samples)",
-                             (long)new_offset, n);
-                } else {
+                if (n == 0) {
                     ESP_LOGW(TAG, "TARE failed: zero successful samples");
+                } else {
+                    int32_t span = tare_max - tare_min;
+                    if (span > BSP_TARE_MAX_SPAN_COUNTS) {
+                        /* H8.1: window too noisy — reject, don't touch
+                         * tare_offset or filter.  User should release
+                         * the screen / let the platform settle and try
+                         * again. */
+                        ESP_LOGW(TAG, "TARE rejected: unstable samples "
+                                      "span=%ld counts (>%d) — previous "
+                                      "tare preserved.  Release the "
+                                      "platform and try again.",
+                                 (long)span, BSP_TARE_MAX_SPAN_COUNTS);
+                    } else {
+                        int32_t new_offset = (int32_t)(sum / n);
+                        int32_t new_net    = s_latest_raw - new_offset;
+                        float   new_g      = s_cal_valid
+                                             ? ((float)new_net / s_cal_factor) : 0.0f;
+                        /* H8: reset the display filter to 0 so the new zero
+                         * is STABLE immediately and not treated as an outlier
+                         * jump from the pre-tare value. */
+                        filter_reset(new_g);
+                        portENTER_CRITICAL(&s_cache_mux);
+                        s_tare_offset  = new_offset;
+                        s_latest_net   = new_net;
+                        s_latest_grams = new_g;
+                        s_stable       = true;
+                        portEXIT_CRITICAL(&s_cache_mux);
+                        ESP_LOGI(TAG, "TARE applied: tare_offset=%ld "
+                                      "span=%ld counts (avg of %d samples)",
+                                 (long)new_offset, (long)span, n);
+                    }
                 }
                 s_tare_in_progress = false;
                 serial_log_counter = 0;  /* force next normal log soon */
@@ -513,6 +677,8 @@ static void hx711_task(void *arg) {
                               HX711_CAL_SAMPLES);
                 int64_t sum_net = 0;
                 int     n       = 0;
+                int32_t net_min = INT32_MAX;
+                int32_t net_max = INT32_MIN;
                 for (int i = 0; i < HX711_CAL_SAMPLES; ++i) {
                     int32_t s;
                     if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
@@ -526,6 +692,8 @@ static void hx711_task(void *arg) {
                     portEXIT_CRITICAL(&s_cache_mux);
                     sum_net += cur_net;
                     n++;
+                    if (cur_net < net_min) net_min = cur_net;
+                    if (cur_net > net_max) net_max = cur_net;
                 }
                 if (n == 0) {
                     ESP_LOGW(TAG, "CAL failed: zero successful samples — "
@@ -534,6 +702,16 @@ static void hx711_task(void *arg) {
                     ESP_LOGW(TAG, "CAL rejected: known_grams=%.1f must be > 0 "
                                   "— previous calibration state preserved",
                              (double)known);
+                } else if ((net_max - net_min) > BSP_CAL_MAX_SPAN_COUNTS) {
+                    /* H8.1: too much motion during collection — reject
+                     * BEFORE computing the factor, so we never overwrite
+                     * a good NVS value with a bad one. */
+                    ESP_LOGW(TAG, "CAL rejected: unstable samples "
+                                  "span=%ld counts (>%d) — previous "
+                                  "calibration preserved.  Wait for the "
+                                  "STABLE indicator before tapping CAL.",
+                             (long)(net_max - net_min),
+                             BSP_CAL_MAX_SPAN_COUNTS);
                 } else {
                     int64_t avg_net = sum_net / n;
                     int64_t abs_avg = avg_net < 0 ? -avg_net : avg_net;
@@ -546,19 +724,28 @@ static void hx711_task(void *arg) {
                     } else {
                         float new_factor = (float)avg_net / known;
                         float new_g      = (float)s_latest_net / new_factor;
+                        /* H8: anchor the filter at the just-measured
+                         * grams (≈ known load) so the next live samples
+                         * are not flagged as outliers vs the previous
+                         * (possibly uncalibrated) EMA. */
+                        filter_reset(new_g);
                         portENTER_CRITICAL(&s_cache_mux);
                         s_cal_factor   = new_factor;
                         s_cal_valid    = true;
                         s_latest_grams = new_g;
+                        s_stable       = true;
                         portEXIT_CRITICAL(&s_cache_mux);
                         ESP_LOGI(TAG, "CAL applied: factor=%.4f counts/g, "
-                                      "avg_net=%lld (avg of %d samples, "
-                                      "known=%.1fg)",
-                                 (double)new_factor, (long long)avg_net, n,
+                                      "avg_net=%lld span=%ld counts "
+                                      "(avg of %d samples, known=%.1fg)",
+                                 (double)new_factor, (long long)avg_net,
+                                 (long)(net_max - net_min), n,
                                  (double)known);
                         /* H7: persist immediately so a reboot restores
                          * the calibration.  Failure logs but does not
-                         * disturb the live RAM cal. */
+                         * disturb the live RAM cal.  H8.1: only reached
+                         * after span check passed — bad windows never
+                         * touch NVS. */
                         (void)cal_save_to_nvs(new_factor, known);
                     }
                 }
@@ -587,13 +774,15 @@ bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net) {
 }
 
 bool hx711_get_snapshot_full(int32_t *out_raw, int32_t *out_net,
-                              float *out_grams, bool *out_cal_valid) {
+                              float *out_grams, bool *out_cal_valid,
+                              bool *out_stable) {
     if (!s_have_sample) return false;
     portENTER_CRITICAL(&s_cache_mux);
     if (out_raw)       *out_raw       = s_latest_raw;
     if (out_net)       *out_net       = s_latest_net;
     if (out_grams)     *out_grams     = s_latest_grams;
     if (out_cal_valid) *out_cal_valid = s_cal_valid;
+    if (out_stable)    *out_stable    = s_stable;
     portEXIT_CRITICAL(&s_cache_mux);
     return true;
 }
