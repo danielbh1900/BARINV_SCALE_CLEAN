@@ -58,6 +58,27 @@ static TaskHandle_t     s_owner_task   = NULL;
 #define HX711_NOTIFY_TARE_BIT   (1u << 0)
 #define HX711_TARE_SAMPLES      8
 
+/* H6: calibration state.  Sole writer is the owner task; readers go
+ * through hx711_get_snapshot_full under s_cache_mux.  Sign of
+ * s_cal_factor is preserved (can be negative if cell polarity is
+ * reversed), so runtime grams come out correctly oriented either way. */
+static volatile float   s_cal_factor       = 0.0f;   /* counts per gram */
+static volatile bool    s_cal_valid        = false;
+static volatile float   s_latest_grams     = 0.0f;
+static volatile float   s_cal_known_grams  = 0.0f;   /* set by request fn */
+
+/* H6: busy guards — set by owner task at start of TARE/CAL collection,
+ * cleared when done.  Request functions reject (and log "ignored —
+ * already in progress") when set.  Single-writer (owner task), so
+ * reading from another task can race a stale value, but the worst case
+ * is a duplicate request that's harmless. */
+static volatile bool    s_tare_in_progress = false;
+static volatile bool    s_cal_in_progress  = false;
+
+#define HX711_NOTIFY_CAL_BIT    (1u << 1)
+#define HX711_CAL_SAMPLES       16
+#define HX711_CAL_MIN_ABS_NET   1000           /* reject if |avg_net| below */
+
 static inline int gain_total_pulses(hx711_gain_t g) {
     switch (g) {
         case HX711_GAIN_128_A: return 25;
@@ -187,10 +208,14 @@ static void hx711_task(void *arg) {
 
         esp_err_t r = hx711_read_raw_blocking(&raw, 200);
         if (r == ESP_OK) {
-            /* H4 + H5: publish (raw, net) atomically before logging. */
+            /* H4 + H5 + H6: publish (raw, net, grams) atomically before
+             * logging.  Grams is computed iff calibration is valid. */
+            int32_t net = raw - s_tare_offset;
+            float   g   = s_cal_valid ? ((float)net / s_cal_factor) : 0.0f;
             portENTER_CRITICAL(&s_cache_mux);
-            s_latest_raw = raw;
-            s_latest_net = raw - s_tare_offset;
+            s_latest_raw   = raw;
+            s_latest_net   = net;
+            s_latest_grams = g;
             portEXIT_CRITICAL(&s_cache_mux);
             s_have_sample = true;
 
@@ -198,9 +223,16 @@ static void hx711_task(void *arg) {
              * console is readable when the UI is doing the primary display.
              * Every 10th read = once per second at 10 Hz cadence. */
             if (++serial_log_counter >= 10) {
-                ESP_LOGI(TAG, "raw=%ld  net=%ld  dout=%d  ready=%d",
-                         (long)raw, (long)(raw - s_tare_offset),
-                         dout_pre, (int)ready);
+                if (s_cal_valid) {
+                    ESP_LOGI(TAG, "raw=%ld  net=%ld  grams=%.1f  "
+                                  "dout=%d ready=%d",
+                             (long)raw, (long)net, (double)g,
+                             dout_pre, (int)ready);
+                } else {
+                    ESP_LOGI(TAG, "raw=%ld  net=%ld  dout=%d ready=%d "
+                                  "(not calibrated)",
+                             (long)raw, (long)net, dout_pre, (int)ready);
+                }
                 serial_log_counter = 0;
             }
 
@@ -231,12 +263,13 @@ static void hx711_task(void *arg) {
             ESP_LOGE(TAG, "read error: %s", esp_err_to_name(r));
         }
 
-        /* H5: process any pending TARE notification.  Non-blocking poll
-         * (timeout = 0) so we never stall the read cadence when no request
-         * is pending. */
+        /* H5 + H6: process any pending TARE / CAL notifications.
+         * Non-blocking poll (timeout = 0) — never stalls the read cadence
+         * when no request is pending. */
         uint32_t notif = 0;
         if (xTaskNotifyWait(0, ULONG_MAX, &notif, 0) == pdPASS) {
             if (notif & HX711_NOTIFY_TARE_BIT) {
+                s_tare_in_progress = true;
                 ESP_LOGI(TAG, "TARE requested — collecting %d samples for "
                               "averaging...", HX711_TARE_SAMPLES);
                 int64_t sum = 0;
@@ -246,18 +279,26 @@ static void hx711_task(void *arg) {
                     if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
                     /* Keep the cache flowing during collection so the UI
                      * doesn't visibly freeze for ~1 s while we tare. */
+                    int32_t cur_net = s - s_tare_offset;
+                    float   cur_g   = s_cal_valid
+                                      ? ((float)cur_net / s_cal_factor) : 0.0f;
                     portENTER_CRITICAL(&s_cache_mux);
-                    s_latest_raw = s;
-                    s_latest_net = s - s_tare_offset;   /* old offset */
+                    s_latest_raw   = s;
+                    s_latest_net   = cur_net;       /* old offset */
+                    s_latest_grams = cur_g;
                     portEXIT_CRITICAL(&s_cache_mux);
                     sum += s;
                     n++;
                 }
                 if (n > 0) {
                     int32_t new_offset = (int32_t)(sum / n);
+                    int32_t new_net    = s_latest_raw - new_offset;
+                    float   new_g      = s_cal_valid
+                                         ? ((float)new_net / s_cal_factor) : 0.0f;
                     portENTER_CRITICAL(&s_cache_mux);
-                    s_tare_offset = new_offset;
-                    s_latest_net  = s_latest_raw - new_offset;
+                    s_tare_offset  = new_offset;
+                    s_latest_net   = new_net;
+                    s_latest_grams = new_g;
                     portEXIT_CRITICAL(&s_cache_mux);
                     ESP_LOGI(TAG, "TARE applied: tare_offset=%ld "
                                   "(avg of %d samples)",
@@ -265,7 +306,63 @@ static void hx711_task(void *arg) {
                 } else {
                     ESP_LOGW(TAG, "TARE failed: zero successful samples");
                 }
+                s_tare_in_progress = false;
                 serial_log_counter = 0;  /* force next normal log soon */
+            }
+            if (notif & HX711_NOTIFY_CAL_BIT) {
+                s_cal_in_progress = true;
+                float known = s_cal_known_grams;
+                ESP_LOGI(TAG, "CAL requested — known_weight=%.1fg, collecting "
+                              "%d samples...", (double)known, HX711_CAL_SAMPLES);
+                int64_t sum_net = 0;
+                int     n       = 0;
+                for (int i = 0; i < HX711_CAL_SAMPLES; ++i) {
+                    int32_t s;
+                    if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
+                    int32_t cur_net = s - s_tare_offset;
+                    float   cur_g   = s_cal_valid
+                                      ? ((float)cur_net / s_cal_factor) : 0.0f;
+                    portENTER_CRITICAL(&s_cache_mux);
+                    s_latest_raw   = s;
+                    s_latest_net   = cur_net;
+                    s_latest_grams = cur_g;
+                    portEXIT_CRITICAL(&s_cache_mux);
+                    sum_net += cur_net;
+                    n++;
+                }
+                if (n == 0) {
+                    ESP_LOGW(TAG, "CAL failed: zero successful samples — "
+                                  "previous calibration state preserved");
+                } else if (known <= 0.0f) {
+                    ESP_LOGW(TAG, "CAL rejected: known_grams=%.1f must be > 0 "
+                                  "— previous calibration state preserved",
+                             (double)known);
+                } else {
+                    int64_t avg_net = sum_net / n;
+                    int64_t abs_avg = avg_net < 0 ? -avg_net : avg_net;
+                    if (abs_avg < HX711_CAL_MIN_ABS_NET) {
+                        ESP_LOGW(TAG, "CAL rejected: |avg_net|=%lld < %d "
+                                      "(no meaningful load on cell) — "
+                                      "previous calibration state preserved. "
+                                      "Place the known weight and try again.",
+                                 (long long)abs_avg, HX711_CAL_MIN_ABS_NET);
+                    } else {
+                        float new_factor = (float)avg_net / known;
+                        float new_g      = (float)s_latest_net / new_factor;
+                        portENTER_CRITICAL(&s_cache_mux);
+                        s_cal_factor   = new_factor;
+                        s_cal_valid    = true;
+                        s_latest_grams = new_g;
+                        portEXIT_CRITICAL(&s_cache_mux);
+                        ESP_LOGI(TAG, "CAL applied: factor=%.4f counts/g, "
+                                      "avg_net=%lld (avg of %d samples, "
+                                      "known=%.1fg)",
+                                 (double)new_factor, (long long)avg_net, n,
+                                 (double)known);
+                    }
+                }
+                s_cal_in_progress = false;
+                serial_log_counter = 0;
             }
         }
 
@@ -288,9 +385,37 @@ bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net) {
     return true;
 }
 
+bool hx711_get_snapshot_full(int32_t *out_raw, int32_t *out_net,
+                              float *out_grams, bool *out_cal_valid) {
+    if (!s_have_sample) return false;
+    portENTER_CRITICAL(&s_cache_mux);
+    if (out_raw)       *out_raw       = s_latest_raw;
+    if (out_net)       *out_net       = s_latest_net;
+    if (out_grams)     *out_grams     = s_latest_grams;
+    if (out_cal_valid) *out_cal_valid = s_cal_valid;
+    portEXIT_CRITICAL(&s_cache_mux);
+    return true;
+}
+
 esp_err_t hx711_request_tare(void) {
     if (!s_task_started || s_owner_task == NULL) return ESP_ERR_INVALID_STATE;
+    if (s_tare_in_progress || s_cal_in_progress) {
+        ESP_LOGW(TAG, "TARE ignored — already in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
     xTaskNotify(s_owner_task, HX711_NOTIFY_TARE_BIT, eSetBits);
+    return ESP_OK;
+}
+
+esp_err_t hx711_request_calibrate(float known_grams) {
+    if (!s_task_started || s_owner_task == NULL) return ESP_ERR_INVALID_STATE;
+    if (known_grams <= 0.0f) return ESP_ERR_INVALID_ARG;
+    if (s_tare_in_progress || s_cal_in_progress) {
+        ESP_LOGW(TAG, "CAL ignored — already in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_cal_known_grams = known_grams;   /* atomic 32-bit store on ESP32-S3 */
+    xTaskNotify(s_owner_task, HX711_NOTIFY_CAL_BIT, eSetBits);
     return ESP_OK;
 }
 

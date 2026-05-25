@@ -69,9 +69,34 @@ bool hx711_get_latest_raw(int32_t *out_raw);
 // stores the result as tare_offset.  After that, the cached `net` reads
 // near 0 at rest and changes with applied load.
 //
-// Returns ESP_OK when the request is enqueued; ESP_ERR_INVALID_STATE if
-// the owner task has not been started yet.  H5 is RAM-only — no NVS.
+// Returns ESP_OK when the request is enqueued.
+//         ESP_ERR_INVALID_STATE if owner task not started OR a TARE/CAL is
+//                               already in progress (H6 busy guard).
+// H5 is RAM-only — no NVS.
 esp_err_t hx711_request_tare(void);
+
+// H6 — CAL
+// Request the owner task to compute a calibration factor with a known
+// reference weight on the cell.  Non-blocking — the UI enqueues and
+// returns immediately.  The owner task collects 16 fresh samples
+// (~1.6 s), averages their net values (after subtracting the current
+// tare_offset), and stores cal_factor = avg_net / known_grams.
+//
+// Sign is preserved naturally — if the cell is wired with opposite
+// polarity, cal_factor will be negative and runtime grams will still
+// come out positive when the same load direction is applied.
+//
+// Rejected (logged, previous cal state preserved) if:
+//   * known_grams <= 0
+//   * |avg_net| < 1000 counts (no meaningful load on the cell)
+//   * zero samples acquired
+//
+// Returns ESP_OK when the request is enqueued.
+//         ESP_ERR_INVALID_STATE if owner task not started OR a TARE/CAL is
+//                               already in progress (H6 busy guard).
+//         ESP_ERR_INVALID_ARG    if known_grams <= 0.
+// H6 is RAM-only — no NVS.
+esp_err_t hx711_request_calibrate(float known_grams);
 
 // Atomic snapshot of (raw, net).  Either out pointer may be NULL.
 // Returns true if at least one sample has been captured since boot, in
@@ -80,3 +105,15 @@ esp_err_t hx711_request_tare(void);
 //   raw  := last successful raw reading
 //   net  := raw - tare_offset  (== raw before the first TARE)
 bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net);
+
+// H6 — full snapshot including calibrated grams.
+//   *out_raw         := last successful raw reading
+//   *out_net         := raw - tare_offset
+//   *out_grams       := net / cal_factor   (valid only if *out_cal_valid)
+//   *out_cal_valid   := true iff calibration has been completed at least
+//                       once since boot
+// Any out pointer may be NULL.  Returns true if at least one sample has
+// been captured since boot.  All fields are read under the per-core
+// portMUX so the (raw, net, grams, cal_valid) tuple is self-consistent.
+bool hx711_get_snapshot_full(int32_t *out_raw, int32_t *out_net,
+                              float *out_grams, bool *out_cal_valid);

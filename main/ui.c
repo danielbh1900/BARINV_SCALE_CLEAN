@@ -22,11 +22,14 @@
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
-#include "hx711.h"     /* H4: pull latest cached raw — no direct hardware access */
+#include "hx711.h"          /* H4: pull cached raw — no direct hardware access */
+#include "board_config.h"   /* H6: BSP_CAL_WEIGHT_GRAMS */
+#include <math.h>           /* H6: fabsf, lroundf */
 
 static const char *TAG = "ui";
 
 static lv_obj_t *s_weight_lbl = NULL;
+static lv_obj_t *s_unit_lbl   = NULL;   /* H6: needed so we can toggle g/kg */
 static lv_obj_t *s_stable_lbl = NULL;
 static lv_obj_t *s_raw_lbl    = NULL;
 
@@ -45,20 +48,47 @@ static void on_tare_clicked(lv_event_t *e) {
 
 static void on_cal_clicked(lv_event_t *e) {
     (void)e;
-    ESP_LOGI(TAG, "CAL clicked");
+    /* H6: UI enqueues a CAL request with the build-time known weight.
+     * Owner task does the 16-sample average + factor math; UI never
+     * touches HX711 hardware. */
+    esp_err_t r = hx711_request_calibrate(BSP_CAL_WEIGHT_GRAMS);
+    if (r == ESP_OK) {
+        ESP_LOGI(TAG, "CAL clicked — calibration request enqueued "
+                      "(known=%.1fg)", (double)BSP_CAL_WEIGHT_GRAMS);
+    } else {
+        ESP_LOGW(TAG, "CAL clicked — hx711_request_calibrate: %s",
+                 esp_err_to_name(r));
+    }
 }
 
-/* H4 + H5: LVGL timer callback — pulls the latest cached HX711 (raw, net)
- * snapshot (no I/O, no protocol, no GPIO) and refreshes the raw label as
- * "raw: N / zero: M".  Runs from inside lv_timer_handler so the LVGL port
- * lock is already held. */
+/* H4 + H5 + H6: LVGL timer callback — pulls the full HX711 snapshot
+ * (raw, net, grams, cal_valid) atomically and refreshes both labels.
+ * No I/O, no protocol, no GPIO — pure cache reads.  Runs from inside
+ * lv_timer_handler so the LVGL port lock is already held. */
 static void ui_poll_raw_cb(lv_timer_t *t) {
     (void)t;
-    if (s_raw_lbl == NULL) return;
-    int32_t raw, net;
-    if (hx711_get_snapshot(&raw, &net)) {
-        lv_label_set_text_fmt(s_raw_lbl, "raw: %ld / zero: %ld",
-                              (long)raw, (long)net);
+    if (s_raw_lbl == NULL || s_weight_lbl == NULL || s_unit_lbl == NULL) return;
+
+    int32_t raw  = 0;
+    int32_t net  = 0;
+    float   grams = 0.0f;
+    bool    cal_valid = false;
+    if (!hx711_get_snapshot_full(&raw, &net, &grams, &cal_valid)) return;
+
+    /* Bottom debug line — always shows the underlying counts. */
+    lv_label_set_text_fmt(s_raw_lbl, "raw: %ld / zero: %ld",
+                          (long)raw, (long)net);
+
+    /* Large weight display. */
+    if (!cal_valid) {
+        lv_label_set_text(s_weight_lbl, "----");
+        lv_label_set_text(s_unit_lbl,   "g");
+    } else if (fabsf(grams) < 1000.0f) {
+        lv_label_set_text_fmt(s_weight_lbl, "%ld", lroundf(grams));
+        lv_label_set_text(s_unit_lbl, "g");
+    } else {
+        lv_label_set_text_fmt(s_weight_lbl, "%.3f", (double)grams / 1000.0);
+        lv_label_set_text(s_unit_lbl, "kg");
     }
 }
 
@@ -89,19 +119,19 @@ void ui_init(void) {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 80);
 
-    // Weight value (large)
+    // Weight value (large) — "----" until first calibration, then g or kg
     s_weight_lbl = lv_label_create(scr);
-    lv_label_set_text(s_weight_lbl, "0.000");
+    lv_label_set_text(s_weight_lbl, "----");
     lv_obj_set_style_text_color(s_weight_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(s_weight_lbl, &lv_font_montserrat_48, 0);
     lv_obj_align(s_weight_lbl, LV_ALIGN_CENTER, 0, -30);
 
-    // Unit
-    lv_obj_t *unit = lv_label_create(scr);
-    lv_label_set_text(unit, "kg");
-    lv_obj_set_style_text_color(unit, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_style_text_font(unit, &lv_font_montserrat_22, 0);
-    lv_obj_align(unit, LV_ALIGN_CENTER, 0, 28);
+    // Unit — flips between "g" and "kg" at runtime based on magnitude
+    s_unit_lbl = lv_label_create(scr);
+    lv_label_set_text(s_unit_lbl, "g");
+    lv_obj_set_style_text_color(s_unit_lbl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_font(s_unit_lbl, &lv_font_montserrat_22, 0);
+    lv_obj_align(s_unit_lbl, LV_ALIGN_CENTER, 0, 28);
 
     // Stable / Unstable
     s_stable_lbl = lv_label_create(scr);

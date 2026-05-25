@@ -114,3 +114,11 @@
   #define BSP_HX711_SCK              43
   #define BSP_HX711_DOUT             44
 #endif
+
+// H6 calibration:  known reference weight used by the CAL button.
+// Tap TARE on empty pan, place exactly this mass, tap CAL.  The owner
+// task averages 16 net samples and stores cal_factor = avg_net / grams.
+// RAM-only — no NVS yet.  Change at build time only.
+#ifndef BSP_CAL_WEIGHT_GRAMS
+#define BSP_CAL_WEIGHT_GRAMS         500.0f
+#endif
