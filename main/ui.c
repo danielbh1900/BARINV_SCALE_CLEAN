@@ -22,6 +22,7 @@
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
+#include "hx711.h"     /* H4: pull latest cached raw — no direct hardware access */
 
 static const char *TAG = "ui";
 
@@ -37,6 +38,18 @@ static void on_tare_clicked(lv_event_t *e) {
 static void on_cal_clicked(lv_event_t *e) {
     (void)e;
     ESP_LOGI(TAG, "CAL clicked");
+}
+
+/* H4: LVGL timer callback — pulls the latest cached HX711 raw (no I/O,
+ * no protocol, no GPIO) and updates the raw label.  Runs from inside
+ * lv_timer_handler so the LVGL port lock is already held. */
+static void ui_poll_raw_cb(lv_timer_t *t) {
+    (void)t;
+    if (s_raw_lbl == NULL) return;
+    int32_t raw;
+    if (hx711_get_latest_raw(&raw)) {
+        lv_label_set_text_fmt(s_raw_lbl, "raw: %ld", (long)raw);
+    }
 }
 
 void ui_init(void) {
@@ -114,8 +127,15 @@ void ui_init(void) {
     lv_obj_set_style_text_font(cal_lbl, &lv_font_montserrat_18, 0);
     lv_obj_center(cal_lbl);
 
+    /* H4: 10 Hz LVGL timer that pulls the latest cached HX711 raw from
+     * the owner task and refreshes the on-screen "raw:" label.  Runs inside
+     * lv_timer_handler → LVGL port lock is already held; safe to touch
+     * widgets directly.  No HX711 hardware/protocol access — only the
+     * thread-safe cache getter. */
+    lv_timer_create(ui_poll_raw_cb, 100, NULL);
+
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "BARINV Scale UI built");
+    ESP_LOGI(TAG, "BARINV Scale UI built (H4: raw label polls hx711 cache @ 10 Hz)");
 }
 
 void ui_set_weight_kg(float kg, bool stable) {

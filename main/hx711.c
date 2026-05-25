@@ -36,6 +36,13 @@ static bool         s_inited       = false;
 static bool         s_task_started = false;
 static portMUX_TYPE s_burst_mux    = portMUX_INITIALIZER_UNLOCKED;
 
+/* H4: latest-raw cache. Written by the owner task, read by any consumer.
+ * int32_t writes are atomic on ESP32-S3 (32-bit aligned single word), so a
+ * mutex isn't needed.  volatile prevents the compiler from caching either
+ * side in a register across a yield point. */
+static volatile int32_t s_latest_raw  = 0;
+static volatile bool    s_have_sample = false;
+
 static inline int gain_total_pulses(hx711_gain_t g) {
     switch (g) {
         case HX711_GAIN_128_A: return 25;
@@ -150,11 +157,12 @@ esp_err_t hx711_set_gain_next(hx711_gain_t g) {
  * ------------------------------------------------------------------------ */
 static void hx711_task(void *arg) {
     (void)arg;
-    int32_t  raw           = 0;
-    int32_t  prev_raw      = 0x7FFFFFFF;   /* impossible 24-bit value */
-    uint32_t stuck_count   = 0;            /* consecutive identical reads */
+    int32_t  raw                = 0;
+    int32_t  prev_raw           = 0x7FFFFFFF;   /* impossible 24-bit value */
+    uint32_t stuck_count        = 0;            /* consecutive identical reads */
+    uint32_t serial_log_counter = 0;            /* H4: throttle serial to ~1 Hz */
     ESP_LOGI(TAG, "owner task running on core %d @ ~10 Hz "
-                  "(raw-only, SCK=GPIO%d DOUT=GPIO%d, BSP_HX711_SWAP_PINS=%d)",
+                  "(SCK=GPIO%d DOUT=GPIO%d, BSP_HX711_SWAP_PINS=%d)",
              (int)xPortGetCoreID(),
              s_sck, s_dout, (int)BSP_HX711_SWAP_PINS);
 
@@ -164,8 +172,19 @@ static void hx711_task(void *arg) {
 
         esp_err_t r = hx711_read_raw_blocking(&raw, 200);
         if (r == ESP_OK) {
-            ESP_LOGI(TAG, "raw=%ld  dout=%d  ready=%d",
-                     (long)raw, dout_pre, (int)ready);
+            /* H4: publish to the cache BEFORE logging so the UI can pick it
+             * up on the very next LVGL timer tick. */
+            s_latest_raw  = raw;
+            s_have_sample = true;
+
+            /* H4: throttle the per-sample ESP_LOGI to ~1 Hz so the serial
+             * console is readable when the UI is doing the primary display.
+             * Every 10th read = once per second at 10 Hz cadence. */
+            if (++serial_log_counter >= 10) {
+                ESP_LOGI(TAG, "raw=%ld  dout=%d  ready=%d",
+                         (long)raw, dout_pre, (int)ready);
+                serial_log_counter = 0;
+            }
 
             /* Stuck-value detection (H3 observability): warn loudly every
              * ~2 s if every read returns the same value AND it's one of
@@ -195,6 +214,12 @@ static void hx711_task(void *arg) {
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+}
+
+bool hx711_get_latest_raw(int32_t *out_raw) {
+    if (out_raw == NULL || !s_have_sample) return false;
+    *out_raw = s_latest_raw;   /* 32-bit aligned volatile read — atomic */
+    return true;
 }
 
 esp_err_t hx711_owner_start(void) {

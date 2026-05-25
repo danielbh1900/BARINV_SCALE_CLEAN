@@ -50,3 +50,13 @@ esp_err_t hx711_set_gain_next(hx711_gain_t g);
 // task is allowed. Idempotent: a second call is a no-op.
 // In H2 the task only ESP_LOGIs raw/dout/ready at ~10 Hz.
 esp_err_t hx711_owner_start(void);
+
+// Thread-safe latest-raw snapshot getter.  This is the ONLY hx711_* call
+// the UI (or any non-owner consumer) is allowed to make.  Reads a single
+// volatile int32_t — naturally atomic on ESP32-S3 — so no lock is needed.
+//
+//   *out_raw  := most recent successful raw reading (sign-extended int32_t)
+//   return    := true if at least one sample has been captured since boot;
+//                false if the owner task has never produced a valid read
+//                yet (in which case *out_raw is left unchanged).
+bool hx711_get_latest_raw(int32_t *out_raw);
