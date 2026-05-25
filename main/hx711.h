@@ -44,3 +44,9 @@ esp_err_t hx711_read_raw_blocking(int32_t *out, uint32_t timeout_ms);
 // the selection at the trailing edge of the (24+N)th SCK pulse).
 // Phase 2 H2 will implement the body.
 esp_err_t hx711_set_gain_next(hx711_gain_t g);
+
+// Spawn the single HX711 owner task. After this returns OK, NO other task
+// (including the UI) may invoke any other hx711_* function — only the owner
+// task is allowed. Idempotent: a second call is a no-op.
+// In H2 the task only ESP_LOGIs raw/dout/ready at ~10 Hz.
+esp_err_t hx711_owner_start(void);

@@ -1,6 +1,6 @@
-// BARINV Scale Clean — Phase 1 (no HX711 yet)
+// BARINV Scale Clean — Phase 2 H2 (raw HX711 serial logging only)
 //
-// Boot order, all proven via SAFEBOOT-1/2/3:
+// Boot order:
 //   1. NVS
 //   2. I2C + TCA9554
 //   3. Backlight LEDC (configured, OFF)
@@ -9,9 +9,10 @@
 //   6. CST820 touch -> registered with LVGL
 //   7. UI (single scale screen)
 //   8. Backlight ON
+//   9. HX711 init + owner task start (serial-log raw/dout/ready only)
 //
-// No tasks spawned here. The LVGL port already runs its own task.
-// HX711 + its owner task come in Phase 2.
+// The LVGL port owns its own task on CPU1. The HX711 owner task lives on
+// CPU0. The UI never calls hx711_* directly — single-owner contract.
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -29,6 +30,8 @@
 #include "cst820_touch.h"
 #include "lvgl_glue.h"
 #include "ui.h"
+#include "hx711.h"
+#include "board_config.h"
 
 static const char *TAG = "barinv";
 
@@ -91,6 +94,21 @@ void app_main(void) {
     ESP_ERROR_CHECK(bsp_backlight_on());
     ESP_LOGI(TAG, "[6/6] backlight ON");
 
-    ESP_LOGI(TAG, "ready — BARINV Scale Clean Phase 1");
-    // app_main returns; LVGL port task and FreeRTOS idle keep the system alive.
+    // ---- HX711 (Phase 2 H2) — owner task, serial-log only ----------------
+    esp_err_t hr = hx711_init(BSP_HX711_SCK, BSP_HX711_DOUT);
+    if (hr == ESP_OK) {
+        hr = hx711_owner_start();
+        if (hr == ESP_OK) {
+            ESP_LOGI(TAG, "[+] HX711 owner task started (raw-only @ ~10 Hz)");
+        } else {
+            ESP_LOGE(TAG, "[+] hx711_owner_start failed: %s",
+                     esp_err_to_name(hr));
+        }
+    } else {
+        ESP_LOGE(TAG, "[+] hx711_init failed: %s", esp_err_to_name(hr));
+    }
+
+    ESP_LOGI(TAG, "ready — BARINV Scale Clean Phase 2 H2");
+    // app_main returns; LVGL port task, HX711 owner task and FreeRTOS idle
+    // keep the system alive.
 }
