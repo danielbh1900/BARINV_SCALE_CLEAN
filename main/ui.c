@@ -32,7 +32,15 @@ static lv_obj_t *s_raw_lbl    = NULL;
 
 static void on_tare_clicked(lv_event_t *e) {
     (void)e;
-    ESP_LOGI(TAG, "TARE clicked");
+    /* H5: UI only enqueues the request.  Owner task does the work
+     * (8-sample average) on its next loop iteration. */
+    esp_err_t r = hx711_request_tare();
+    if (r == ESP_OK) {
+        ESP_LOGI(TAG, "TARE clicked — request enqueued");
+    } else {
+        ESP_LOGW(TAG, "TARE clicked — hx711_request_tare: %s",
+                 esp_err_to_name(r));
+    }
 }
 
 static void on_cal_clicked(lv_event_t *e) {
@@ -40,15 +48,17 @@ static void on_cal_clicked(lv_event_t *e) {
     ESP_LOGI(TAG, "CAL clicked");
 }
 
-/* H4: LVGL timer callback — pulls the latest cached HX711 raw (no I/O,
- * no protocol, no GPIO) and updates the raw label.  Runs from inside
- * lv_timer_handler so the LVGL port lock is already held. */
+/* H4 + H5: LVGL timer callback — pulls the latest cached HX711 (raw, net)
+ * snapshot (no I/O, no protocol, no GPIO) and refreshes the raw label as
+ * "raw: N / zero: M".  Runs from inside lv_timer_handler so the LVGL port
+ * lock is already held. */
 static void ui_poll_raw_cb(lv_timer_t *t) {
     (void)t;
     if (s_raw_lbl == NULL) return;
-    int32_t raw;
-    if (hx711_get_latest_raw(&raw)) {
-        lv_label_set_text_fmt(s_raw_lbl, "raw: %ld", (long)raw);
+    int32_t raw, net;
+    if (hx711_get_snapshot(&raw, &net)) {
+        lv_label_set_text_fmt(s_raw_lbl, "raw: %ld / zero: %ld",
+                              (long)raw, (long)net);
     }
 }
 

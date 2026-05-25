@@ -51,8 +51,8 @@ esp_err_t hx711_set_gain_next(hx711_gain_t g);
 // In H2 the task only ESP_LOGIs raw/dout/ready at ~10 Hz.
 esp_err_t hx711_owner_start(void);
 
-// Thread-safe latest-raw snapshot getter.  This is the ONLY hx711_* call
-// the UI (or any non-owner consumer) is allowed to make.  Reads a single
+// Thread-safe latest-raw snapshot getter.  This is one of the cache-only
+// hx711_* calls non-owner consumers are allowed to make.  Reads a single
 // volatile int32_t — naturally atomic on ESP32-S3 — so no lock is needed.
 //
 //   *out_raw  := most recent successful raw reading (sign-extended int32_t)
@@ -60,3 +60,23 @@ esp_err_t hx711_owner_start(void);
 //                false if the owner task has never produced a valid read
 //                yet (in which case *out_raw is left unchanged).
 bool hx711_get_latest_raw(int32_t *out_raw);
+
+// H5 — TARE
+// Request the owner task to set a new tare zero.  Non-blocking — the UI
+// just enqueues a notification and returns immediately.  The owner task
+// processes the request at its next loop iteration: it collects 8 fresh
+// raw samples (~800 ms with the 10 Hz HX711 RATE pin), averages them, and
+// stores the result as tare_offset.  After that, the cached `net` reads
+// near 0 at rest and changes with applied load.
+//
+// Returns ESP_OK when the request is enqueued; ESP_ERR_INVALID_STATE if
+// the owner task has not been started yet.  H5 is RAM-only — no NVS.
+esp_err_t hx711_request_tare(void);
+
+// Atomic snapshot of (raw, net).  Either out pointer may be NULL.
+// Returns true if at least one sample has been captured since boot, in
+// which case both fields are written under a per-core portMUX so the
+// (raw, net) pair is always self-consistent.
+//   raw  := last successful raw reading
+//   net  := raw - tare_offset  (== raw before the first TARE)
+bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net);

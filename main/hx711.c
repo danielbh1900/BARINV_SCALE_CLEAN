@@ -43,6 +43,21 @@ static portMUX_TYPE s_burst_mux    = portMUX_INITIALIZER_UNLOCKED;
 static volatile int32_t s_latest_raw  = 0;
 static volatile bool    s_have_sample = false;
 
+/* H5: TARE state — owner task is sole writer; non-owner consumers read via
+ * hx711_get_snapshot().  s_cache_mux makes (raw, net) updates atomic as a
+ * pair — without it a reader could see new raw with old net or vice versa.
+ * RAM-only in H5; no NVS yet. */
+static volatile int32_t s_latest_net   = 0;
+static volatile int32_t s_tare_offset  = 0;
+static portMUX_TYPE     s_cache_mux    = portMUX_INITIALIZER_UNLOCKED;
+
+/* Owner task handle stored at create time so hx711_request_tare() can
+ * post a notification to it. */
+static TaskHandle_t     s_owner_task   = NULL;
+
+#define HX711_NOTIFY_TARE_BIT   (1u << 0)
+#define HX711_TARE_SAMPLES      8
+
 static inline int gain_total_pulses(hx711_gain_t g) {
     switch (g) {
         case HX711_GAIN_128_A: return 25;
@@ -172,17 +187,20 @@ static void hx711_task(void *arg) {
 
         esp_err_t r = hx711_read_raw_blocking(&raw, 200);
         if (r == ESP_OK) {
-            /* H4: publish to the cache BEFORE logging so the UI can pick it
-             * up on the very next LVGL timer tick. */
-            s_latest_raw  = raw;
+            /* H4 + H5: publish (raw, net) atomically before logging. */
+            portENTER_CRITICAL(&s_cache_mux);
+            s_latest_raw = raw;
+            s_latest_net = raw - s_tare_offset;
+            portEXIT_CRITICAL(&s_cache_mux);
             s_have_sample = true;
 
             /* H4: throttle the per-sample ESP_LOGI to ~1 Hz so the serial
              * console is readable when the UI is doing the primary display.
              * Every 10th read = once per second at 10 Hz cadence. */
             if (++serial_log_counter >= 10) {
-                ESP_LOGI(TAG, "raw=%ld  dout=%d  ready=%d",
-                         (long)raw, dout_pre, (int)ready);
+                ESP_LOGI(TAG, "raw=%ld  net=%ld  dout=%d  ready=%d",
+                         (long)raw, (long)(raw - s_tare_offset),
+                         dout_pre, (int)ready);
                 serial_log_counter = 0;
             }
 
@@ -212,6 +230,45 @@ static void hx711_task(void *arg) {
         } else {
             ESP_LOGE(TAG, "read error: %s", esp_err_to_name(r));
         }
+
+        /* H5: process any pending TARE notification.  Non-blocking poll
+         * (timeout = 0) so we never stall the read cadence when no request
+         * is pending. */
+        uint32_t notif = 0;
+        if (xTaskNotifyWait(0, ULONG_MAX, &notif, 0) == pdPASS) {
+            if (notif & HX711_NOTIFY_TARE_BIT) {
+                ESP_LOGI(TAG, "TARE requested — collecting %d samples for "
+                              "averaging...", HX711_TARE_SAMPLES);
+                int64_t sum = 0;
+                int     n   = 0;
+                for (int i = 0; i < HX711_TARE_SAMPLES; ++i) {
+                    int32_t s;
+                    if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
+                    /* Keep the cache flowing during collection so the UI
+                     * doesn't visibly freeze for ~1 s while we tare. */
+                    portENTER_CRITICAL(&s_cache_mux);
+                    s_latest_raw = s;
+                    s_latest_net = s - s_tare_offset;   /* old offset */
+                    portEXIT_CRITICAL(&s_cache_mux);
+                    sum += s;
+                    n++;
+                }
+                if (n > 0) {
+                    int32_t new_offset = (int32_t)(sum / n);
+                    portENTER_CRITICAL(&s_cache_mux);
+                    s_tare_offset = new_offset;
+                    s_latest_net  = s_latest_raw - new_offset;
+                    portEXIT_CRITICAL(&s_cache_mux);
+                    ESP_LOGI(TAG, "TARE applied: tare_offset=%ld "
+                                  "(avg of %d samples)",
+                             (long)new_offset, n);
+                } else {
+                    ESP_LOGW(TAG, "TARE failed: zero successful samples");
+                }
+                serial_log_counter = 0;  /* force next normal log soon */
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -220,6 +277,21 @@ bool hx711_get_latest_raw(int32_t *out_raw) {
     if (out_raw == NULL || !s_have_sample) return false;
     *out_raw = s_latest_raw;   /* 32-bit aligned volatile read — atomic */
     return true;
+}
+
+bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net) {
+    if (!s_have_sample) return false;
+    portENTER_CRITICAL(&s_cache_mux);
+    if (out_raw) *out_raw = s_latest_raw;
+    if (out_net) *out_net = s_latest_net;
+    portEXIT_CRITICAL(&s_cache_mux);
+    return true;
+}
+
+esp_err_t hx711_request_tare(void) {
+    if (!s_task_started || s_owner_task == NULL) return ESP_ERR_INVALID_STATE;
+    xTaskNotify(s_owner_task, HX711_NOTIFY_TARE_BIT, eSetBits);
+    return ESP_OK;
 }
 
 esp_err_t hx711_owner_start(void) {
@@ -232,7 +304,7 @@ esp_err_t hx711_owner_start(void) {
         4096,                 /* stack */
         NULL,                 /* arg */
         3,                    /* priority — below LVGL's 4 */
-        NULL,
+        &s_owner_task,        /* H5: capture handle for xTaskNotify */
         0);                   /* CPU0 — LVGL lives on CPU1 */
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreatePinnedToCore failed");
