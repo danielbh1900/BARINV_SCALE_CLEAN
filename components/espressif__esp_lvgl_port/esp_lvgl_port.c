@@ -15,6 +15,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lvgl_port.h"
+#include "driver/gpio.h"     /* BARINV patch: needed for touch-INT gating */
 
 #include "lvgl.h"
 
@@ -824,15 +825,48 @@ static void lvgl_port_pix_monochrome_callback(lv_disp_drv_t *drv, uint8_t *buf, 
 }
 
 #ifdef ESP_LVGL_PORT_TOUCH_COMPONENT
+
+/* BARINV patch — touch-INT gating.
+ *
+ * The CST816S/CST820 on the Waveshare ESP32-S3 Touch LCD 2.1 enters
+ * auto-sleep between touch events.  In that state the chip NAKs every
+ * I2C transaction, so calling esp_lcd_touch_read_data on every LVGL poll
+ * (every ~5 ms) produces a torrent of "lcd_panel.io.i2c: i2c transaction
+ * failed" + "CST816S: read_data: I2C read failed" log lines.
+ *
+ * The INT pin (push-pull, active LOW on event) IS already configured as
+ * INPUT/NEGEDGE by the cst816s driver — we just poll its level here and
+ * skip the I2C read entirely when it is HIGH (no pending event).  This
+ * eliminates the I2C error spam without losing touch responsiveness.
+ *
+ * Hardcoded for the BARINV board contract (BSP_TOUCH_PIN_INT = GPIO16).
+ * If a future board has a different INT pin, change BARINV_TOUCH_INT_GPIO. */
+#define BARINV_TOUCH_INT_GPIO     16
+
 static void lvgl_port_touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     assert(indev_drv);
     lvgl_port_touch_ctx_t *touch_ctx = (lvgl_port_touch_ctx_t *)indev_drv->user_data;
     assert(touch_ctx->handle);
 
+    /* BARINV INT-gate: skip the i2c poll entirely when chip is idle. */
+    if (gpio_get_level(BARINV_TOUCH_INT_GPIO) == 1) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+
+    /* One-time INFO the first time INT actually goes low (confirms the
+       gate is wired right against real touch events). */
+    static bool s_logged_first_touch = false;
+    if (!s_logged_first_touch) {
+        ESP_LOGI(TAG, "touch INT (GPIO%d) first asserted — gate is live",
+                 BARINV_TOUCH_INT_GPIO);
+        s_logged_first_touch = true;
+    }
+
     uint16_t touchpad_x[1] = {0};
     uint16_t touchpad_y[1] = {0};
-    uint8_t touchpad_cnt = 0;
+    uint8_t  touchpad_cnt  = 0;
 
     /* Read data from touch controller into memory */
     esp_lcd_touch_read_data(touch_ctx->handle);
