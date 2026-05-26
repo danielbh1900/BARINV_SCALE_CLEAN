@@ -32,21 +32,18 @@ static const char *TAG = "ui";
 static lv_obj_t *s_weight_lbl = NULL;
 static lv_obj_t *s_unit_lbl   = NULL;   /* H6: needed so we can toggle g/kg */
 static lv_obj_t *s_stable_lbl = NULL;
-
-/* H9.0: set TRUE by the screen-level PRESSED handler when a tap arrives
- * while we were in SOFT_STANDBY.  Button CLICKED handlers check this on
- * entry and return early without performing the action — the wake tap
- * is consumed.  Overwritten on every PRESSED, so stale "true" from a
- * non-button standby-tap is naturally cleared by the next tap. */
-static volatile bool s_consume_next_click = false;
+/* H9.0.1: consume-flag moved into power_mgr; UI just queries
+ * power_mgr_consume_wake_tap() in each button CLICKED handler. */
 static lv_obj_t *s_raw_lbl    = NULL;
 
 static void on_tare_clicked(lv_event_t *e) {
     (void)e;
-    /* H9.0: consume the wake-from-standby tap so a finger that happens
-     * to land on TARE doesn't trigger a tare immediately on wake. */
-    if (s_consume_next_click) {
-        s_consume_next_click = false;
+    /* H9.0.1: consume the wake-from-standby tap.  power_mgr arms the
+     * flag on every standby->active transition (via either LVGL press
+     * or the GPIO16 poll) for BSP_WAKE_TAP_WINDOW_MS ms.  After that
+     * window expires, clicks behave normally — no risk of a stale
+     * consume eating a later real click. */
+    if (power_mgr_consume_wake_tap()) {
         ESP_LOGI(TAG, "TARE tap consumed (wake from SOFT_STANDBY)");
         return;
     }
@@ -63,10 +60,8 @@ static void on_tare_clicked(lv_event_t *e) {
 
 static void on_cal_clicked(lv_event_t *e) {
     (void)e;
-    /* H9.0: consume the wake-from-standby tap so a finger that happens
-     * to land on CAL doesn't trigger a calibration immediately on wake. */
-    if (s_consume_next_click) {
-        s_consume_next_click = false;
+    /* H9.0.1: consume the wake-from-standby tap (see TARE handler). */
+    if (power_mgr_consume_wake_tap()) {
         ESP_LOGI(TAG, "CAL tap consumed (wake from SOFT_STANDBY)");
         return;
     }
@@ -83,17 +78,16 @@ static void on_cal_clicked(lv_event_t *e) {
     }
 }
 
-/* H9.0: screen-level PRESSED handler — fires for every touch press
- * (bubbles up from whichever object was hit, including the screen
- * itself for empty-area taps).  Always registers activity (resets the
- * idle timer + wakes if standby) and snapshots the standby state into
- * s_consume_next_click so button CLICKED handlers can early-return on
- * the wake tap.  No fancy LVGL indev manipulation needed. */
+/* H9.0 + H9.0.1: screen-level PRESSED handler.  Fires for every touch
+ * press (bubbles up from whichever object was hit).  Just registers
+ * activity — power_mgr handles the wake transition AND arms the
+ * wake-tap consume window itself.  In H9.0.1 the GPIO16 poll usually
+ * fires first (faster than the LVGL+CST820 pipeline), and this handler
+ * becomes a no-op for the wake itself; it still resets the idle timer
+ * for subsequent activity. */
 static void scr_pressed_cb(lv_event_t *e) {
     (void)e;
-    bool was_standby = power_mgr_is_standby();
     power_mgr_register_activity();
-    s_consume_next_click = was_standby;
 }
 
 /* H4 + H5 + H6 + H8: LVGL timer callback — pulls the full HX711 snapshot

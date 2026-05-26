@@ -27,8 +27,18 @@ esp_err_t power_mgr_init(void);
 // from any task or LVGL event callback.
 void power_mgr_register_activity(void);
 
-// True iff currently in SOFT_STANDBY.  Cheap atomic read.  Use this
-// from UI event callbacks to decide whether the current tap should be
-// consumed as a wake gesture (and thus NOT trigger the underlying
-// button action).
+// True iff currently in SOFT_STANDBY.  Cheap atomic read.
 bool power_mgr_is_standby(void);
+
+// H9.0.1: check-and-consume the wake-tap flag.
+//   * Returns TRUE if the system just transitioned from SOFT_STANDBY
+//     to ACTIVE within the last BSP_WAKE_TAP_WINDOW_MS milliseconds
+//     AND this is the first call within that window.  The caller (UI
+//     button CLICKED handler) should early-return without executing
+//     its action — this tap was the wake gesture.
+//   * Returns FALSE otherwise (normal click, proceed with action).
+//   * Side effect: clears the flag on TRUE return.
+//   * Thread-safe.  Cheap.  Bounded — flag auto-expires after the
+//     wake-tap window, so a stale wake from a non-button standby tap
+//     does not eat a later real button click.
+bool power_mgr_consume_wake_tap(void);

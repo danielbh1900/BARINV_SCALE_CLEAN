@@ -220,8 +220,28 @@
 #ifndef BSP_ACTIVE_BACKLIGHT_DUTY
 #define BSP_ACTIVE_BACKLIGHT_DUTY      BSP_LCD_BACKLIGHT_DEFAULT
 #endif
-// Reserved for H9.0.1 hardware-LEDC fade implementation; H9.0 uses a
+// Reserved for hardware-LEDC fade implementation; H9.0/H9.0.1 use a
 // snap transition (no fade) to keep the change surface minimal.
 #ifndef BSP_STANDBY_BACKLIGHT_FADE_MS
 #define BSP_STANDBY_BACKLIGHT_FADE_MS    200
+#endif
+
+// H9.0.1: GPIO16 (touch INT) poll cadence while in SOFT_STANDBY.
+// Bypasses LVGL/CST820 first-tap wake jitter — the CST820 sometimes
+// burns the first tap waking the chip without delivering an event to
+// LVGL, which led to the user-visible "second tap needed" bug in H9.0.
+// We poll GPIO16 directly at this rate ONLY while in standby; the
+// timer is stopped on wake so it costs nothing in ACTIVE.
+#ifndef BSP_STANDBY_INT_POLL_MS
+#define BSP_STANDBY_INT_POLL_MS            30
+#endif
+
+// H9.0.1: time window after a wake transition during which a button
+// CLICKED is treated as the "wake tap" and consumed (does not execute
+// the underlying TARE/CAL action).  After this window expires the
+// next click is a normal click.  Prevents stale consume-flag from a
+// non-button standby tap (which would otherwise eat the next real
+// click much later).
+#ifndef BSP_WAKE_TAP_WINDOW_MS
+#define BSP_WAKE_TAP_WINDOW_MS            500
 #endif
