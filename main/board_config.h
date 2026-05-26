@@ -245,3 +245,21 @@
 #ifndef BSP_WAKE_TAP_WINDOW_MS
 #define BSP_WAKE_TAP_WINDOW_MS            500
 #endif
+
+// H9.1 (safe rev): HX711 inter-sample idle period.  power_mgr swaps
+// between these on SOFT_STANDBY transitions.
+//
+// SAFETY NOTE: the FIRST H9.1 attempt also tried to wake the HX711
+// owner task out of its sleep via the same xTaskNotify slot used for
+// TARE/CAL — that interfered with TARE/CAL reliability and was
+// rolled back.  This safe revision uses only a volatile period
+// variable read into a plain vTaskDelay; the HX711 owner task's
+// notification slot is left identical to stable-h9.0.1.  Trade-off:
+// a rate change has up to `current_period_ms` of latency to take
+// effect (≤ 1 s coming out of standby).  Worth the simpler safety.
+#ifndef BSP_HX711_ACTIVE_PERIOD_MS
+#define BSP_HX711_ACTIVE_PERIOD_MS        100
+#endif
+#ifndef BSP_HX711_STANDBY_PERIOD_MS
+#define BSP_HX711_STANDBY_PERIOD_MS      1000
+#endif

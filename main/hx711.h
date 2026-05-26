@@ -106,6 +106,19 @@ esp_err_t hx711_request_calibrate(float known_grams);
 //   net  := raw - tare_offset  (== raw before the first TARE)
 bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net);
 
+// H9.1 (safe rev) — power-managed inter-sample period.
+//   Called only by power_mgr on SOFT_STANDBY transitions.  Updates a
+//   volatile uint32_t that the owner task reads once per loop iteration
+//   into its vTaskDelay.  Does NOT touch the task notification slot —
+//   TARE/CAL paths remain identical to stable-h9.0.1.
+//   Trade-off: a rate change takes effect on the next sample boundary,
+//   so coming out of standby (1000 ms) → active (100 ms) has up to
+//   ~1 s of HX711 cadence latency.  Acceptable for now; the screen
+//   wake itself is still instant via the GPIO16 INT poll in power_mgr.
+//   Clamped to [10, 60000] ms.  Returns ESP_OK, or ESP_ERR_INVALID_STATE
+//   if the owner task has not been started yet.
+esp_err_t hx711_set_period_ms(uint32_t period_ms);
+
 // H6 + H8 — full snapshot including filtered grams and stability flag.
 //   *out_raw         := last successful raw reading
 //   *out_net         := raw - tare_offset

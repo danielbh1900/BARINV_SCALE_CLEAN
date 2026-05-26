@@ -96,6 +96,13 @@ static volatile bool    s_cal_in_progress  = false;
  * "boot auto-tare in progress" log line. */
 static volatile bool    s_boot_autotare_in_progress = false;
 
+/* H9.1 (safe rev): owner-task inter-sample idle period in ms.  Read
+ * once per loop iteration into vTaskDelay.  Written by
+ * hx711_set_period_ms() — does NOT touch any task notification slot,
+ * so TARE/CAL paths stay identical to stable-h9.0.1.  Default 100 ms
+ * (= 10 Hz).  Initialised in hx711_owner_start. */
+static volatile uint32_t s_period_ms = 100;
+
 /* H8 + H8.1: display filter state.  All fields are owner-task private —
  * NOT exposed through the snapshot getter; only the post-filter grams
  * + stable flag travel through s_cache_mux. */
@@ -551,10 +558,13 @@ static void hx711_task(void *arg) {
             portEXIT_CRITICAL(&s_cache_mux);
             s_have_sample = true;
 
-            /* H4: throttle the per-sample ESP_LOGI to ~1 Hz so the serial
-             * console is readable when the UI is doing the primary display.
-             * Every 10th read = once per second at 10 Hz cadence. */
-            if (++serial_log_counter >= 10) {
+            /* H4 + H9.1 (safe rev): adaptive serial throttle.  Targets
+             * ~1 Hz log cadence regardless of sample period — active
+             * (100 ms) → log every 10th; standby (1000 ms) → log every
+             * sample.  s_period_ms == 0 is clamped to 1 by the math. */
+            uint32_t log_every_n = (s_period_ms > 0) ? (1000u / s_period_ms) : 10u;
+            if (log_every_n == 0) log_every_n = 1;
+            if (++serial_log_counter >= log_every_n) {
                 if (s_cal_valid) {
                     ESP_LOGI(TAG, "raw=%ld  net=%ld  g_raw=%.1f  g_filt=%.1f  "
                                   "stable=%d  dout=%d ready=%d",
@@ -754,7 +764,13 @@ static void hx711_task(void *arg) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        /* H9.1 (safe rev): inter-sample sleep using the volatile
+         * period.  Plain vTaskDelay — leaves the task notification
+         * slot untouched so TARE/CAL reach the next iteration exactly
+         * as they did in stable-h9.0.1.  Trade-off: a rate change made
+         * via hx711_set_period_ms() takes effect on the next iteration
+         * (up to `current_period_ms` later). */
+        vTaskDelay(pdMS_TO_TICKS(s_period_ms));
     }
 }
 
@@ -801,6 +817,20 @@ esp_err_t hx711_request_tare(void) {
     return ESP_OK;
 }
 
+esp_err_t hx711_set_period_ms(uint32_t period_ms) {
+    if (!s_task_started) return ESP_ERR_INVALID_STATE;
+    if (period_ms < 10)    period_ms = 10;
+    if (period_ms > 60000) period_ms = 60000;
+    if (period_ms == s_period_ms) return ESP_OK;
+    s_period_ms = period_ms;
+    /* DELIBERATELY no xTaskNotify here.  This is the safety lesson
+     * from the first H9.1 attempt: sharing the owner task's
+     * notification slot with TARE/CAL broke TARE.  The volatile is
+     * picked up on the next loop iteration (≤ current_period_ms). */
+    ESP_LOGI(TAG, "sample period changed to %u ms", (unsigned)period_ms);
+    return ESP_OK;
+}
+
 esp_err_t hx711_request_calibrate(float known_grams) {
     if (!s_task_started || s_owner_task == NULL) return ESP_ERR_INVALID_STATE;
     if (known_grams <= 0.0f) return ESP_ERR_INVALID_ARG;
@@ -820,6 +850,9 @@ esp_err_t hx711_request_calibrate(float known_grams) {
 esp_err_t hx711_owner_start(void) {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
     if (s_task_started) return ESP_OK;
+
+    /* H9.1 (safe rev): start at active rate. */
+    s_period_ms = BSP_HX711_ACTIVE_PERIOD_MS;
 
     /* H7: load saved calibration (if any) BEFORE the task spawns so the
      * very first cached sample already has correct grams.  Soft-failure:

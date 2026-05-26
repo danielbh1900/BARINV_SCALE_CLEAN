@@ -14,6 +14,7 @@
 #include "power_mgr.h"
 #include "board_config.h"
 #include "backlight.h"
+#include "hx711.h"          /* H9.1 (safe rev): rate change on standby edge */
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -46,10 +47,18 @@ static volatile int64_t     s_wake_tap_window_us = 0;
 static void enter_soft_standby(void) {
     s_state = PM_SOFT_STANDBY;
     (void)bsp_backlight_set(BSP_STANDBY_BACKLIGHT_DUTY);
+    /* H9.1 (safe rev): slow HX711 to standby period.  Volatile write
+     * only — no task-notification poke (that's what broke the first
+     * H9.1 attempt by interfering with TARE/CAL).  The new period is
+     * picked up on the next loop iteration (≤ 100 ms here, since the
+     * task was running at active rate immediately before this). */
+    (void)hx711_set_period_ms(BSP_HX711_STANDBY_PERIOD_MS);
     ESP_LOGI(TAG, "entering SOFT_STANDBY after %d ms idle "
-                  "(backlight duty -> %d; GPIO%d poll @ %d ms)",
+                  "(backlight duty -> %d; GPIO%d poll @ %d ms; "
+                  "HX711 period -> %d ms)",
              BSP_IDLE_TO_STANDBY_MS, BSP_STANDBY_BACKLIGHT_DUTY,
-             BSP_TOUCH_PIN_INT, BSP_STANDBY_INT_POLL_MS);
+             BSP_TOUCH_PIN_INT, BSP_STANDBY_INT_POLL_MS,
+             BSP_HX711_STANDBY_PERIOD_MS);
     /* H9.0.1: start the dedicated GPIO16 poll timer.  Safe to call
      * even if already running — esp_timer_start_periodic returns
      * ESP_ERR_INVALID_STATE which we ignore. */
@@ -73,9 +82,18 @@ static void exit_soft_standby(const char *reason) {
     if (s_standby_poll_timer) {
         (void)esp_timer_stop(s_standby_poll_timer);
     }
+    /* H9.1 (safe rev): restore active sample rate.  Same as standby
+     * entry — pure volatile write, no notification.  Latency: up to
+     * `current_period_ms` (= 1 s if the task is mid-sleep at standby
+     * rate when wake fires) before HX711 cadence resumes 10 Hz.  The
+     * display itself is already lit instantly by the backlight set
+     * above; this only governs HX711 sampling cadence. */
+    (void)hx711_set_period_ms(BSP_HX711_ACTIVE_PERIOD_MS);
     ESP_LOGI(TAG, "wake requested by %s — ACTIVE "
-                  "(backlight duty -> %d; tap window %d ms)",
-             reason, BSP_ACTIVE_BACKLIGHT_DUTY, BSP_WAKE_TAP_WINDOW_MS);
+                  "(backlight duty -> %d; tap window %d ms; "
+                  "HX711 period -> %d ms)",
+             reason, BSP_ACTIVE_BACKLIGHT_DUTY, BSP_WAKE_TAP_WINDOW_MS,
+             BSP_HX711_ACTIVE_PERIOD_MS);
 }
 
 /* esp_timer task — runs every 1 s.  Keep work tiny here — no blocking,
