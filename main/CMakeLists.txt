@@ -9,6 +9,7 @@ idf_component_register(
         "cst820_touch.c"
         "lvgl_glue.c"
         "hx711.c"
+        "power_mgr.c"
     INCLUDE_DIRS
         "."
     REQUIRES

@@ -32,6 +32,7 @@
 #include "ui.h"
 #include "hx711.h"
 #include "board_config.h"
+#include "power_mgr.h"      /* H9.0: soft-standby */
 
 static const char *TAG = "barinv";
 
@@ -106,6 +107,18 @@ void app_main(void) {
         }
     } else {
         ESP_LOGE(TAG, "[+] hx711_init failed: %s", esp_err_to_name(hr));
+    }
+
+    /* H9.0: soft-standby power manager — backlight off on idle,
+     * touch wakes.  No deep sleep, no HX711 rate change. */
+    {
+        esp_err_t pr = power_mgr_init();
+        if (pr == ESP_OK) {
+            ESP_LOGI(TAG, "[+] power manager started (H9.0 soft standby)");
+        } else {
+            ESP_LOGE(TAG, "[+] power_mgr_init failed: %s — staying ACTIVE",
+                     esp_err_to_name(pr));
+        }
     }
 
     ESP_LOGI(TAG, "ready — BARINV Scale Clean Phase 2 H2");

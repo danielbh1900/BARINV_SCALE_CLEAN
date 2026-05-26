@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "hx711.h"          /* H4: pull cached raw — no direct hardware access */
 #include "board_config.h"   /* H6: BSP_CAL_WEIGHT_GRAMS */
+#include "power_mgr.h"      /* H9.0: register activity, wake on tap */
 #include <math.h>           /* H6: fabsf, lroundf */
 
 static const char *TAG = "ui";
@@ -31,10 +32,24 @@ static const char *TAG = "ui";
 static lv_obj_t *s_weight_lbl = NULL;
 static lv_obj_t *s_unit_lbl   = NULL;   /* H6: needed so we can toggle g/kg */
 static lv_obj_t *s_stable_lbl = NULL;
+
+/* H9.0: set TRUE by the screen-level PRESSED handler when a tap arrives
+ * while we were in SOFT_STANDBY.  Button CLICKED handlers check this on
+ * entry and return early without performing the action — the wake tap
+ * is consumed.  Overwritten on every PRESSED, so stale "true" from a
+ * non-button standby-tap is naturally cleared by the next tap. */
+static volatile bool s_consume_next_click = false;
 static lv_obj_t *s_raw_lbl    = NULL;
 
 static void on_tare_clicked(lv_event_t *e) {
     (void)e;
+    /* H9.0: consume the wake-from-standby tap so a finger that happens
+     * to land on TARE doesn't trigger a tare immediately on wake. */
+    if (s_consume_next_click) {
+        s_consume_next_click = false;
+        ESP_LOGI(TAG, "TARE tap consumed (wake from SOFT_STANDBY)");
+        return;
+    }
     /* H5: UI only enqueues the request.  Owner task does the work
      * (8-sample average) on its next loop iteration. */
     esp_err_t r = hx711_request_tare();
@@ -48,6 +63,13 @@ static void on_tare_clicked(lv_event_t *e) {
 
 static void on_cal_clicked(lv_event_t *e) {
     (void)e;
+    /* H9.0: consume the wake-from-standby tap so a finger that happens
+     * to land on CAL doesn't trigger a calibration immediately on wake. */
+    if (s_consume_next_click) {
+        s_consume_next_click = false;
+        ESP_LOGI(TAG, "CAL tap consumed (wake from SOFT_STANDBY)");
+        return;
+    }
     /* H6: UI enqueues a CAL request with the build-time known weight.
      * Owner task does the 16-sample average + factor math; UI never
      * touches HX711 hardware. */
@@ -59,6 +81,19 @@ static void on_cal_clicked(lv_event_t *e) {
         ESP_LOGW(TAG, "CAL clicked — hx711_request_calibrate: %s",
                  esp_err_to_name(r));
     }
+}
+
+/* H9.0: screen-level PRESSED handler — fires for every touch press
+ * (bubbles up from whichever object was hit, including the screen
+ * itself for empty-area taps).  Always registers activity (resets the
+ * idle timer + wakes if standby) and snapshots the standby state into
+ * s_consume_next_click so button CLICKED handlers can early-return on
+ * the wake tap.  No fancy LVGL indev manipulation needed. */
+static void scr_pressed_cb(lv_event_t *e) {
+    (void)e;
+    bool was_standby = power_mgr_is_standby();
+    power_mgr_register_activity();
+    s_consume_next_click = was_standby;
 }
 
 /* H4 + H5 + H6 + H8: LVGL timer callback — pulls the full HX711 snapshot
@@ -189,8 +224,14 @@ void ui_init(void) {
      * thread-safe cache getter. */
     lv_timer_create(ui_poll_raw_cb, 100, NULL);
 
+    /* H9.0: install screen-level PRESSED handler for activity + wake.
+     * Every touch (button or empty area) bubbles a PRESSED event up to
+     * the screen, so this single handler covers all taps. */
+    lv_obj_add_event_cb(scr, scr_pressed_cb, LV_EVENT_PRESSED, NULL);
+
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "BARINV Scale UI built (H4: raw label polls hx711 cache @ 10 Hz)");
+    ESP_LOGI(TAG, "BARINV Scale UI built (H4: raw label polls hx711 cache @ 10 Hz; "
+                  "H9.0: tap-to-wake handler installed)");
 }
 
 void ui_set_weight_kg(float kg, bool stable) {

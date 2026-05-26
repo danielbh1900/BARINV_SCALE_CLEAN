@@ -202,3 +202,26 @@
 #ifndef BSP_CAL_MAX_SPAN_COUNTS
 #define BSP_CAL_MAX_SPAN_COUNTS      5000
 #endif
+
+// H9.0: soft-standby (display-off) idle timing.
+// After this many milliseconds with no touch activity, the backlight
+// snaps off (BSP_STANDBY_BACKLIGHT_DUTY).  Any touch wakes the screen
+// back to BSP_ACTIVE_BACKLIGHT_DUTY and resets the idle timer.
+// HX711 keeps running at full 10 Hz throughout — deep sleep is NOT
+// entered in H9.0 (that lives in H9.1).
+// The first wake-tap is consumed by the UI so it does not also trigger
+// a TARE or CAL action under the finger.
+#ifndef BSP_IDLE_TO_STANDBY_MS
+#define BSP_IDLE_TO_STANDBY_MS         30000
+#endif
+#ifndef BSP_STANDBY_BACKLIGHT_DUTY
+#define BSP_STANDBY_BACKLIGHT_DUTY         0
+#endif
+#ifndef BSP_ACTIVE_BACKLIGHT_DUTY
+#define BSP_ACTIVE_BACKLIGHT_DUTY      BSP_LCD_BACKLIGHT_DEFAULT
+#endif
+// Reserved for H9.0.1 hardware-LEDC fade implementation; H9.0 uses a
+// snap transition (no fade) to keep the change surface minimal.
+#ifndef BSP_STANDBY_BACKLIGHT_FADE_MS
+#define BSP_STANDBY_BACKLIGHT_FADE_MS    200
+#endif
