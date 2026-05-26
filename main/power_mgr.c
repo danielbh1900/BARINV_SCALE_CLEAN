@@ -16,6 +16,7 @@
 #include "backlight.h"
 #include "hx711.h"          /* H9.1 (safe rev): rate change on standby edge */
                             /* H9.2:           snapshot read for weight-aware */
+                            /* H9.6:           hx711_is_busy() for standby gate */
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -45,6 +46,15 @@ static esp_timer_handle_t   s_standby_poll_timer = NULL;
  * sustained block (e.g. weight sitting on the platform for an hour)
  * doesn't fill the console. */
 static int64_t              s_last_block_log_us  = 0;
+
+/* H9.6: weight-activity tracking.  Compares this-tick grams against
+ * the previous tick; deltas above BSP_POWER_WEIGHT_ACTIVITY_DELTA_G
+ * arm a hold timer that blocks SOFT_STANDBY for the next
+ * BSP_POWER_ACTIVITY_HOLD_MS.  Catches "user placed/removed a load
+ * and stepped away momentarily". */
+static float                s_last_observed_grams     = 0.0f;
+static bool                 s_have_last_grams         = false;
+static int64_t              s_last_weight_activity_us = 0;
 
 /* H9.0.1: wake-tap window.  Set to esp_timer_get_time() on every
  * SOFT_STANDBY → ACTIVE transition.  power_mgr_consume_wake_tap()
@@ -110,27 +120,54 @@ static void exit_soft_standby(const char *reason) {
 /* esp_timer task — runs every 1 s.  Keep work tiny here — no blocking,
  * no log spam unless transitioning.
  *
- * H9.2: default-deny standby gate.  Even when idle ≥ threshold, we only
- * enter SOFT_STANDBY if the HX711 snapshot agrees that the platform is
- * empty + stable + calibrated.  Read-only access via the public
- * hx711_get_snapshot_full() — no GPIO/protocol calls into HX711. */
+ * H9.2 + H9.6: default-deny standby gate.  We only enter SOFT_STANDBY
+ * when EVERY one of these holds:
+ *   * idle for ≥ BSP_IDLE_TO_STANDBY_MS
+ *   * no TARE / CAL / boot-auto-tare in progress    (H9.6)
+ *   * calibration exists                             (H9.2)
+ *   * platform empty (|grams| ≤ threshold)           (H9.2)
+ *   * H8 STABLE flag true                            (H9.2)
+ *   * no recent weight delta > threshold within ACTIVITY_HOLD_MS  (H9.6)
+ *
+ * Always reads the public HX711 snapshot — never touches HX711 hardware. */
 static void idle_check_cb(void *arg) {
     (void)arg;
     if (s_state != PM_ACTIVE) return;
     int64_t now_us  = esp_timer_get_time();
+
+    /* Get one snapshot for both the weight-activity tracker AND the
+     * standby gate evaluation below.  Doing this every tick (1 Hz)
+     * makes the activity detector work even when the user isn't
+     * touching the screen. */
+    int32_t raw       = 0, net = 0;
+    float   grams     = 0.0f;
+    bool    cal_valid = false, stable = false;
+    bool    have_snap = hx711_get_snapshot_full(&raw, &net, &grams,
+                                                 &cal_valid, &stable);
+
+    /* H9.6: weight-activity tracking. */
+    if (have_snap && cal_valid) {
+        if (s_have_last_grams) {
+            float delta = fabsf(grams - s_last_observed_grams);
+            if (delta > BSP_POWER_WEIGHT_ACTIVITY_DELTA_G) {
+                s_last_weight_activity_us = now_us;
+            }
+        }
+        s_last_observed_grams = grams;
+        s_have_last_grams     = true;
+    }
+
     int64_t idle_ms = (now_us - s_last_activity_us) / 1000;
     if (idle_ms < (int64_t)BSP_IDLE_TO_STANDBY_MS) return;
 
     /* Idle threshold reached — evaluate weight-aware preconditions. */
     bool        ok_to_standby = false;
     const char *block_reason  = "no sample yet";
-    int32_t     raw           = 0;
-    int32_t     net           = 0;
-    float       grams         = 0.0f;
-    bool        cal_valid     = false;
-    bool        stable        = false;
 
-    if (hx711_get_snapshot_full(&raw, &net, &grams, &cal_valid, &stable)) {
+    /* H9.6: never enter standby while a calibration action is running. */
+    if (hx711_is_busy()) {
+        block_reason = "tare/cal in progress";
+    } else if (have_snap) {
         if (!cal_valid) {
             block_reason = "uncalibrated";
         }
@@ -144,6 +181,13 @@ static void idle_check_cb(void *arg) {
             block_reason = "scale unstable";
         }
 #endif
+        /* H9.6: weight activity hold — block for HOLD_MS after the
+         * most recent weight change of > ACTIVITY_DELTA_G. */
+        else if (s_last_weight_activity_us > 0 &&
+                 (now_us - s_last_weight_activity_us) <
+                     (int64_t)BSP_POWER_ACTIVITY_HOLD_MS * 1000) {
+            block_reason = "recent weight activity";
+        }
         else {
             ok_to_standby = true;
         }
@@ -189,6 +233,19 @@ void power_mgr_register_activity(void) {
 
 bool power_mgr_is_standby(void) {
     return s_state == PM_SOFT_STANDBY;
+}
+
+bool power_mgr_ui_actions_blocked(void) {
+    /* H9.6: non-consuming wake-touch guard.  Returns true if the most
+     * recent SOFT_STANDBY → ACTIVE transition was within
+     * BSP_WAKE_TOUCH_GUARD_MS.  Used by UI button CLICKED handlers to
+     * unconditionally early-return — replaces the single-shot
+     * consume_wake_tap pattern, which had a race when LVGL dispatched
+     * multiple CLICKED events from a single sustained touch. */
+    int64_t armed = s_wake_tap_window_us;
+    if (armed == 0) return false;
+    int64_t now = esp_timer_get_time();
+    return (now - armed) <= (int64_t)BSP_WAKE_TOUCH_GUARD_MS * 1000;
 }
 
 bool power_mgr_consume_wake_tap(void) {

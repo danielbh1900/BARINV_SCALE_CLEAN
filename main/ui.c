@@ -25,7 +25,9 @@
 #include "hx711.h"          /* H4: pull cached raw — no direct hardware access */
 #include "board_config.h"   /* H6: BSP_CAL_WEIGHT_GRAMS */
 #include "power_mgr.h"      /* H9.0: register activity, wake on tap */
-#include <math.h>           /* H6: fabsf, lroundf */
+#include "buzzer.h"         /* H9.4: short chirp on accepted tap */
+#include "esp_timer.h"      /* H9.7: throttle diagnostic logs */
+#include <math.h>           /* H6: fabsf, lroundf, isnan, isinf */
 
 static const char *TAG = "ui";
 
@@ -34,19 +36,28 @@ static lv_obj_t *s_unit_lbl   = NULL;   /* H6: needed so we can toggle g/kg */
 static lv_obj_t *s_stable_lbl = NULL;
 /* H9.0.1: consume-flag moved into power_mgr; UI just queries
  * power_mgr_consume_wake_tap() in each button CLICKED handler. */
+
+/* H9.5: display-only zero-lock state.  Hysteretic — entering at
+ * BSP_DISPLAY_ZERO_LOCK_G, leaving at BSP_DISPLAY_ZERO_RELEASE_G.
+ * Pure UI; never touches HX711 cache or NVS. */
+static bool s_zero_locked = false;
 static lv_obj_t *s_raw_lbl    = NULL;
 
 static void on_tare_clicked(lv_event_t *e) {
     (void)e;
-    /* H9.0.1: consume the wake-from-standby tap.  power_mgr arms the
-     * flag on every standby->active transition (via either LVGL press
-     * or the GPIO16 poll) for BSP_WAKE_TAP_WINDOW_MS ms.  After that
-     * window expires, clicks behave normally — no risk of a stale
-     * consume eating a later real click. */
-    if (power_mgr_consume_wake_tap()) {
-        ESP_LOGI(TAG, "TARE tap consumed (wake from SOFT_STANDBY)");
+    /* H9.6: blanket wake-touch guard — non-consuming, covers multiple
+     * click events during BSP_WAKE_TOUCH_GUARD_MS.  Replaces the
+     * H9.0.1 consume_wake_tap that could leak when LVGL fired two
+     * CLICKEDs from one sustained touch.  Checked FIRST so a wake-tap
+     * landing on TARE never zeroes the scale. */
+    if (power_mgr_ui_actions_blocked()) {
+        ESP_LOGI(TAG, "TARE: UI action blocked — wake touch consumed");
         return;
     }
+    /* H9.4: short chirp acknowledges the button press (does NOT
+     * mean the action has completed — that's the TARE-success beep
+     * from the HX711 owner task several seconds later). */
+    buzzer_tap();
     /* H5: UI only enqueues the request.  Owner task does the work
      * (8-sample average) on its next loop iteration. */
     esp_err_t r = hx711_request_tare();
@@ -60,11 +71,13 @@ static void on_tare_clicked(lv_event_t *e) {
 
 static void on_cal_clicked(lv_event_t *e) {
     (void)e;
-    /* H9.0.1: consume the wake-from-standby tap (see TARE handler). */
-    if (power_mgr_consume_wake_tap()) {
-        ESP_LOGI(TAG, "CAL tap consumed (wake from SOFT_STANDBY)");
+    /* H9.6: blanket wake-touch guard (see TARE handler comment). */
+    if (power_mgr_ui_actions_blocked()) {
+        ESP_LOGI(TAG, "CAL: UI action blocked — wake touch consumed");
         return;
     }
+    /* H9.4: tap acknowledgement chirp (see TARE handler comment). */
+    buzzer_tap();
     /* H6: UI enqueues a CAL request with the build-time known weight.
      * Owner task does the 16-sample average + factor math; UI never
      * touches HX711 hardware. */
@@ -110,23 +123,114 @@ static void ui_poll_raw_cb(lv_timer_t *t) {
     lv_label_set_text_fmt(s_raw_lbl, "raw: %ld / zero: %ld",
                           (long)raw, (long)net);
 
-    /* Large weight display (uses filtered grams from H8). */
+    /* H9.5: display-only zero-lock with hysteresis.  Pure UI smoothing
+     * — internal grams/raw/net/cache/NVS are NOT modified, only the
+     * value we hand to lv_label_set_text. */
+#if BSP_DISPLAY_ZERO_LOCK_ENABLE
+    float display_grams = grams;
+    if (cal_valid) {
+        if (s_zero_locked) {
+            /* Stay locked at 0 until grams crosses the wider release
+             * threshold — prevents flicker between -2 and +5 g. */
+            if (fabsf(grams) > BSP_DISPLAY_ZERO_RELEASE_G) {
+                s_zero_locked = false;
+            } else {
+                display_grams = 0.0f;
+            }
+        } else {
+            /* Enter lock only when the H8 stability flag confirms
+             * settled motion AND grams is inside the tighter lock band. */
+            if (stable && fabsf(grams) <= BSP_DISPLAY_ZERO_LOCK_G) {
+                s_zero_locked = true;
+                display_grams = 0.0f;
+            }
+        }
+    } else {
+        s_zero_locked = false;   /* uncal → no lock possible */
+    }
+#else
+    float display_grams = grams;
+    (void)s_zero_locked;
+#endif
+
+    /* H9.7: large weight display.
+     *
+     * INTEGER-ONLY formatting throughout — our sdkconfig has
+     * CONFIG_LV_SPRINTF_USE_FLOAT=n, so LVGL's mini-printf cannot
+     * format "%f" / "%.3f".  Previously a kg display silently emitted
+     * a single "f"/"F" character instead of "1.680".  Compute the
+     * decimal split with integer math and use "%s%ld.%03ld" so the
+     * output is identical regardless of LVGL's printf configuration. */
     if (!cal_valid) {
         lv_label_set_text(s_weight_lbl, "----");
         lv_label_set_text(s_unit_lbl,   "g");
-    } else if (fabsf(grams) < 1000.0f) {
-        lv_label_set_text_fmt(s_weight_lbl, "%ld", lroundf(grams));
+    } else if (isnan(display_grams) || isinf(display_grams)) {
+        /* Defensive — shouldn't happen since cal_factor is checked for
+         * zero on NVS load.  Logged once per 5 s if it ever does. */
+        static int64_t s_last_fault_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_fault_log_us > 5LL * 1000 * 1000) {
+            ESP_LOGW(TAG, "display fault — NaN/Inf grams "
+                          "(raw=%ld net=%ld cal_valid=%d stable=%d)",
+                     (long)raw, (long)net, (int)cal_valid, (int)stable);
+            s_last_fault_log_us = now_us;
+        }
+        lv_label_set_text(s_weight_lbl, "---");
+        lv_label_set_text(s_unit_lbl,   "g");
+    } else if (fabsf(display_grams) > BSP_SCALE_OVERLOAD_G) {
+        /* Beyond safe display range — most likely cell saturation. */
+        static int64_t s_last_ovl_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_ovl_log_us > 5LL * 1000 * 1000) {
+            ESP_LOGW(TAG, "display fault — OVERLOAD grams=%ld > limit=%ld "
+                          "(raw=%ld net=%ld)",
+                     lroundf(display_grams),
+                     lroundf(BSP_SCALE_OVERLOAD_G),
+                     (long)raw, (long)net);
+            s_last_ovl_log_us = now_us;
+        }
+        lv_label_set_text(s_weight_lbl, "OVER");
+        lv_label_set_text(s_unit_lbl,   "kg");
+    } else if (fabsf(display_grams) < 1000.0f) {
+        lv_label_set_text_fmt(s_weight_lbl, "%ld", lroundf(display_grams));
         lv_label_set_text(s_unit_lbl, "g");
     } else {
-        lv_label_set_text_fmt(s_weight_lbl, "%.3f", (double)grams / 1000.0);
+        /* INTEGER-only kg format: %s%ld.%03ld.  Handles negatives,
+         * works with or without LVGL float-printf support. */
+        long total_g = (long)lroundf(display_grams);
+        bool neg     = (total_g < 0);
+        long ag      = neg ? -total_g : total_g;
+        long kg      = ag / 1000;
+        long fr      = ag % 1000;
+        lv_label_set_text_fmt(s_weight_lbl, "%s%ld.%03ld",
+                              neg ? "-" : "", kg, fr);
         lv_label_set_text(s_unit_lbl, "kg");
+
+        /* H9.7: high-weight diagnostic log — throttled to 5 s.  Lets
+         * us correlate displayed kg against raw counts / cal_factor
+         * for accuracy analysis on multi-kg loads. */
+        static int64_t s_last_high_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_high_log_us > 5LL * 1000 * 1000) {
+            ESP_LOGI(TAG, "display kg=%s%ld.%03ld  raw=%ld net=%ld grams=%ld",
+                     neg ? "-" : "", kg, fr,
+                     (long)raw, (long)net, total_g);
+            s_last_high_log_us = now_us;
+        }
     }
 
-    /* H8: stability indicator — green STABLE when steady, gray --- when
-     * settling.  Hidden ("---" gray) until calibration is loaded. */
+    /* H8 + H9.5: stability/zero indicator.  Hidden ("---" gray) until
+     * calibration is loaded.  Green "ZERO" when display zero-lock is
+     * active (calibrated, stable, near zero).  Green "STABLE" when
+     * calibrated + stable but not near zero.  Otherwise "---". */
     if (!cal_valid) {
         lv_label_set_text(s_stable_lbl, "---");
         lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x808080), 0);
+#if BSP_DISPLAY_ZERO_LOCK_ENABLE
+    } else if (s_zero_locked) {
+        lv_label_set_text(s_stable_lbl, "ZERO");
+        lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x4CAF50), 0);
+#endif
     } else if (stable) {
         lv_label_set_text(s_stable_lbl, "STABLE");
         lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x4CAF50), 0);

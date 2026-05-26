@@ -10,6 +10,7 @@ idf_component_register(
         "lvgl_glue.c"
         "hx711.c"
         "power_mgr.c"
+        "buzzer.c"
     INCLUDE_DIRS
         "."
     REQUIRES

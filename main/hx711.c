@@ -30,6 +30,12 @@
 /* H8: floating-point math */
 #include <math.h>
 
+/* H9.3: esp_timer_get_time() for the CAL cooldown timestamp */
+#include "esp_timer.h"
+
+/* H9.4: non-blocking buzzer feedback */
+#include "buzzer.h"
+
 /* H7: NVS persistence for calibration only.  TARE stays RAM-only — load
  * cell zero drifts with temperature / mounting, so it must be a user
  * action after every boot. */
@@ -102,6 +108,11 @@ static volatile bool    s_boot_autotare_in_progress = false;
  * so TARE/CAL paths stay identical to stable-h9.0.1.  Default 100 ms
  * (= 10 Hz).  Initialised in hx711_owner_start. */
 static volatile uint32_t s_period_ms = 100;
+
+/* H9.3: timestamp of the last CAL request (accepted or rejected).
+ * hx711_request_calibrate refuses another request within
+ * BSP_CAL_COOLDOWN_MS of this — protects NVS from rapid retries. */
+static int64_t s_last_cal_request_us = 0;
 
 /* H8 + H8.1: display filter state.  All fields are owner-task private —
  * NOT exposed through the snapshot getter; only the post-filter grams
@@ -355,6 +366,37 @@ static void hx711_settle(uint32_t settle_ms) {
         s_latest_grams = cur_g;
         portEXIT_CRITICAL(&s_cache_mux);
     }
+}
+
+/* H9.3.2: stability-hold gate.  Reads N fresh raw samples (each is a
+ * real bit-banged read at the chip's natural ~10 Hz, so this blocks
+ * for ~N × 100 ms), tracks min/max, and returns true if the spread is
+ * within `max_drift_counts`.  Cache is updated on each read so the UI
+ * keeps ticking during the hold.  Used by both TARE and CAL handlers
+ * after the existing post-settle precheck — catches the case where the
+ * single-snapshot precheck happens to land on a transiently-stable
+ * reading that's actually drifting underneath. */
+static bool stability_hold_check(int n_samples, int32_t max_drift_counts) {
+    int32_t min_raw = INT32_MAX;
+    int32_t max_raw = INT32_MIN;
+    int     got     = 0;
+    for (int i = 0; i < n_samples; ++i) {
+        int32_t s;
+        if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
+        if (s < min_raw) min_raw = s;
+        if (s > max_raw) max_raw = s;
+        got++;
+        /* keep cache flowing so UI does not freeze during the hold */
+        int32_t cur_net = s - s_tare_offset;
+        float   cur_g   = s_cal_valid ? ((float)cur_net / s_cal_factor) : 0.0f;
+        portENTER_CRITICAL(&s_cache_mux);
+        s_latest_raw   = s;
+        s_latest_net   = cur_net;
+        s_latest_grams = cur_g;
+        portEXIT_CRITICAL(&s_cache_mux);
+        if ((max_raw - min_raw) > max_drift_counts) return false;   /* early out */
+    }
+    return (got > 0) && ((max_raw - min_raw) <= max_drift_counts);
 }
 
 static inline int gain_total_pulses(hx711_gain_t g) {
@@ -612,9 +654,69 @@ static void hx711_task(void *arg) {
         if (xTaskNotifyWait(0, ULONG_MAX, &notif, 0) == pdPASS) {
             if (notif & HX711_NOTIFY_TARE_BIT) {
                 s_tare_in_progress = true;
-                ESP_LOGI(TAG, "TARE requested — release scale, settling "
+                ESP_LOGI(TAG, "TARE requested — release hands, settling "
                               "%d ms...", BSP_TARE_SETTLE_MS);
                 hx711_settle(BSP_TARE_SETTLE_MS);
+
+                /* H9.3.1 + H9.6: post-settle prechecks.  Two gates: H9.3.1
+                 * requires the H8 STABLE flag (gated on cal_valid); H9.6
+                 * additionally requires the platform to be empty (also
+                 * gated on cal_valid — uncalibrated state can't measure
+                 * weight, so we let the initial TARE through).  Either
+                 * failure preserves the existing tare offset. */
+                bool tare_precheck_failed = false;
+                {
+                    int32_t  pre_raw = 0, pre_net = 0;
+                    float    pre_grams = 0.0f;
+                    bool     pre_cal_valid = false, pre_stable = false;
+                    if (hx711_get_snapshot_full(&pre_raw, &pre_net, &pre_grams,
+                                                 &pre_cal_valid, &pre_stable)) {
+                        if (pre_cal_valid && !pre_stable) {
+                            ESP_LOGW(TAG, "TARE precheck rejected — not "
+                                          "stable after settle (grams=%.1f) "
+                                          "— previous tare preserved",
+                                     (double)pre_grams);
+                            buzzer_error();
+                            tare_precheck_failed = true;
+                        }
+#if BSP_TARE_REQUIRE_EMPTY
+                        else if (pre_cal_valid &&
+                                 fabsf(pre_grams) > BSP_TARE_EMPTY_LIMIT_G) {
+                            ESP_LOGW(TAG, "TARE rejected — platform not "
+                                          "empty (grams=%.1f, limit=%.1fg) "
+                                          "— remove weight before tare "
+                                          "(previous tare preserved)",
+                                     (double)pre_grams,
+                                     (double)BSP_TARE_EMPTY_LIMIT_G);
+                            buzzer_error();
+                            tare_precheck_failed = true;
+                        }
+#endif
+                    }
+                }
+                if (tare_precheck_failed) {
+                    s_tare_in_progress = false;
+                    serial_log_counter = 0;
+                    goto tare_done;   /* skip collection + apply */
+                }
+
+                /* H9.3.2: stability-hold gate.  Even after the snapshot
+                 * precheck passes, take a few fresh raw reads in a row
+                 * and require all to agree within max_drift counts.
+                 * Catches drift the single-snapshot check misses. */
+                if (!stability_hold_check(BSP_ACTION_STABLE_HOLD_SAMPLES,
+                                          BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS)) {
+                    ESP_LOGW(TAG, "TARE rejected: stability hold failed "
+                                  "(drift > %d counts across %d samples) "
+                                  "— previous tare preserved",
+                             BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS,
+                             BSP_ACTION_STABLE_HOLD_SAMPLES);
+                    buzzer_error();
+                    s_tare_in_progress = false;
+                    serial_log_counter = 0;
+                    goto tare_done;
+                }
+
                 ESP_LOGI(TAG, "TARE: collecting %d samples for averaging...",
                               HX711_TARE_SAMPLES);
                 int64_t sum = 0;
@@ -641,6 +743,7 @@ static void hx711_task(void *arg) {
                 }
                 if (n == 0) {
                     ESP_LOGW(TAG, "TARE failed: zero successful samples");
+                    buzzer_error();
                 } else {
                     int32_t span = tare_max - tare_min;
                     if (span > BSP_TARE_MAX_SPAN_COUNTS) {
@@ -653,6 +756,7 @@ static void hx711_task(void *arg) {
                                       "tare preserved.  Release the "
                                       "platform and try again.",
                                  (long)span, BSP_TARE_MAX_SPAN_COUNTS);
+                        buzzer_error();
                     } else {
                         int32_t new_offset = (int32_t)(sum / n);
                         int32_t new_net    = s_latest_raw - new_offset;
@@ -671,18 +775,101 @@ static void hx711_task(void *arg) {
                         ESP_LOGI(TAG, "TARE applied: tare_offset=%ld "
                                       "span=%ld counts (avg of %d samples)",
                                  (long)new_offset, (long)span, n);
+                        buzzer_success_tare();
                     }
                 }
                 s_tare_in_progress = false;
                 serial_log_counter = 0;  /* force next normal log soon */
+            tare_done: ;   /* H9.3.1: precheck-skip target */
             }
             if (notif & HX711_NOTIFY_CAL_BIT) {
                 s_cal_in_progress = true;
                 float known = s_cal_known_grams;
                 ESP_LOGI(TAG, "CAL requested — known_weight=%.1fg, release "
-                              "button, settling %d ms...",
+                              "hands, settling %d ms...",
                               (double)known, BSP_CAL_SETTLE_MS);
                 hx711_settle(BSP_CAL_SETTLE_MS);
+
+                /* H9.3.1: post-settle precheck — runs AFTER the finger
+                 * has had BSP_CAL_SETTLE_MS to release.  Only enforced
+                 * when calibration already exists (uncalibrated scale
+                 * has stable forever-false because filtered grams is
+                 * pinned at 0; we let the initial CAL through and
+                 * rely on the post-collection span guard). */
+                bool cal_precheck_failed = false;
+                {
+                    int32_t pre_raw = 0, pre_net = 0;
+                    float   pre_grams = 0.0f;
+                    bool    pre_cal_valid = false, pre_stable = false;
+                    if (hx711_get_snapshot_full(&pre_raw, &pre_net, &pre_grams,
+                                                 &pre_cal_valid, &pre_stable)) {
+                        if (pre_cal_valid) {
+                            if (!pre_stable) {
+                                ESP_LOGW(TAG, "CAL precheck rejected — not "
+                                              "stable after settle "
+                                              "(grams=%.1f) — previous "
+                                              "calibration preserved",
+                                         (double)pre_grams);
+                                buzzer_error();
+                                cal_precheck_failed = true;
+                            } else {
+                                /* H9.5: the "current grams too far from
+                                 * known" branch USED to be a hard reject.
+                                 * That trapped users whose previous NVS
+                                 * factor was wrong — the displayed grams
+                                 * would be wildly off the known weight
+                                 * even with the correct mass on the pan,
+                                 * and every CAL attempt would be rejected,
+                                 * preserving the bad factor forever.
+                                 *
+                                 * Now downgraded to a warning.  Stability
+                                 * hold + |avg_net| guard + span guard +
+                                 * verification pass (with fresh raw
+                                 * samples against the candidate factor)
+                                 * remain the only hard gates for NVS
+                                 * write.  Recovery from a bad NVS factor
+                                 * is now possible. */
+                                float tol = known * BSP_CAL_TOLERANCE_FRACTION;
+                                if (fabsf(pre_grams - known) > tol) {
+                                    ESP_LOGW(TAG, "CAL recovery warning — "
+                                                  "current displayed grams "
+                                                  "%.1f far from known %.1f "
+                                                  "(tolerance ±%.1f g) — "
+                                                  "continuing because old "
+                                                  "factor may be wrong; "
+                                                  "verification pass will "
+                                                  "still gate NVS save.",
+                                             (double)pre_grams, (double)known,
+                                             (double)tol);
+                                    /* do NOT set cal_precheck_failed */
+                                }
+                            }
+                        }
+                    }
+                }
+                if (cal_precheck_failed) {
+                    s_cal_in_progress = false;
+                    serial_log_counter = 0;
+                    goto cal_done;   /* skip collection + acceptance */
+                }
+
+                /* H9.3.2: stability-hold gate before collection (same
+                 * idea as TARE — fresh raw reads must agree within
+                 * max_drift counts).  Catches drift the single-snapshot
+                 * precheck misses. */
+                if (!stability_hold_check(BSP_ACTION_STABLE_HOLD_SAMPLES,
+                                          BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS)) {
+                    ESP_LOGW(TAG, "CAL rejected: stability hold failed "
+                                  "(drift > %d counts across %d samples) "
+                                  "— previous calibration preserved",
+                             BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS,
+                             BSP_ACTION_STABLE_HOLD_SAMPLES);
+                    buzzer_error();
+                    s_cal_in_progress = false;
+                    serial_log_counter = 0;
+                    goto cal_done;
+                }
+
                 ESP_LOGI(TAG, "CAL: collecting %d samples for averaging...",
                               HX711_CAL_SAMPLES);
                 int64_t sum_net = 0;
@@ -708,10 +895,12 @@ static void hx711_task(void *arg) {
                 if (n == 0) {
                     ESP_LOGW(TAG, "CAL failed: zero successful samples — "
                                   "previous calibration state preserved");
+                    buzzer_error();
                 } else if (known <= 0.0f) {
                     ESP_LOGW(TAG, "CAL rejected: known_grams=%.1f must be > 0 "
                                   "— previous calibration state preserved",
                              (double)known);
+                    buzzer_error();
                 } else if ((net_max - net_min) > BSP_CAL_MAX_SPAN_COUNTS) {
                     /* H8.1: too much motion during collection — reject
                      * BEFORE computing the factor, so we never overwrite
@@ -722,6 +911,7 @@ static void hx711_task(void *arg) {
                                   "STABLE indicator before tapping CAL.",
                              (long)(net_max - net_min),
                              BSP_CAL_MAX_SPAN_COUNTS);
+                    buzzer_error();
                 } else {
                     int64_t avg_net = sum_net / n;
                     int64_t abs_avg = avg_net < 0 ? -avg_net : avg_net;
@@ -731,36 +921,126 @@ static void hx711_task(void *arg) {
                                       "previous calibration state preserved. "
                                       "Place the known weight and try again.",
                                  (long long)abs_avg, HX711_CAL_MIN_ABS_NET);
+                        buzzer_error();
                     } else {
-                        float new_factor = (float)avg_net / known;
-                        float new_g      = (float)s_latest_net / new_factor;
-                        /* H8: anchor the filter at the just-measured
-                         * grams (≈ known load) so the next live samples
-                         * are not flagged as outliers vs the previous
-                         * (possibly uncalibrated) EMA. */
-                        filter_reset(new_g);
-                        portENTER_CRITICAL(&s_cache_mux);
-                        s_cal_factor   = new_factor;
-                        s_cal_valid    = true;
-                        s_latest_grams = new_g;
-                        s_stable       = true;
-                        portEXIT_CRITICAL(&s_cache_mux);
-                        ESP_LOGI(TAG, "CAL applied: factor=%.4f counts/g, "
-                                      "avg_net=%lld span=%ld counts "
-                                      "(avg of %d samples, known=%.1fg)",
-                                 (double)new_factor, (long long)avg_net,
-                                 (long)(net_max - net_min), n,
-                                 (double)known);
-                        /* H7: persist immediately so a reboot restores
-                         * the calibration.  Failure logs but does not
-                         * disturb the live RAM cal.  H8.1: only reached
-                         * after span check passed — bad windows never
-                         * touch NVS. */
-                        (void)cal_save_to_nvs(new_factor, known);
+                        /* H9.3.2: COMPUTE candidate but DO NOT install
+                         * yet.  Run a verify pass with fresh raw reads
+                         * and only install + save NVS if the candidate
+                         * predicts the known weight within tolerance.
+                         * If verify fails, s_cal_factor / s_cal_valid
+                         * are left unchanged — previous NVS preserved. */
+                        float candidate = (float)avg_net / known;
+                        ESP_LOGI(TAG, "CAL candidate factor=%.4f counts/g "
+                                      "(avg_net=%lld span=%ld counts, %d samples)",
+                                 (double)candidate, (long long)avg_net,
+                                 (long)(net_max - net_min), n);
+
+                        /* H9.5: candidate-vs-previous-factor sanity check.
+                         * Informational ONLY — never rejects.  The
+                         * verification pass below is the only hard gate
+                         * for accepting/rejecting the candidate. */
+                        if (s_cal_valid && s_cal_factor != 0.0f) {
+                            float old_factor = s_cal_factor;
+                            float diff_frac  = fabsf(candidate - old_factor)
+                                               / fabsf(old_factor);
+                            if (diff_frac > BSP_CAL_FACTOR_DRIFT_STRONG_FRACTION) {
+                                ESP_LOGW(TAG, "CAL factor sanity STRONG: "
+                                              "candidate %.4f differs >%.0f%% "
+                                              "from previous %.4f (diff=%.0f%%) "
+                                              "— old factor likely wrong; "
+                                              "relying on verification.",
+                                         (double)candidate,
+                                         (double)BSP_CAL_FACTOR_DRIFT_STRONG_FRACTION * 100,
+                                         (double)old_factor,
+                                         (double)diff_frac * 100);
+                            } else if (diff_frac > BSP_CAL_FACTOR_DRIFT_WARN_FRACTION) {
+                                ESP_LOGW(TAG, "CAL factor sanity: candidate "
+                                              "%.4f differs >%.0f%% from "
+                                              "previous %.4f (diff=%.0f%%) — "
+                                              "proceeding; verification will "
+                                              "confirm.",
+                                         (double)candidate,
+                                         (double)BSP_CAL_FACTOR_DRIFT_WARN_FRACTION * 100,
+                                         (double)old_factor,
+                                         (double)diff_frac * 100);
+                            }
+                        }
+
+                        /* Verify: BSP_CAL_VERIFY_SAMPLES fresh raw reads,
+                         * compute fresh_avg_net / candidate, compare to
+                         * known.  Cache stays on the OLD factor here so
+                         * the UI doesn't flicker to a value we might
+                         * roll back. */
+                        int64_t verify_sum_net = 0;
+                        int     verify_n       = 0;
+                        for (int j = 0; j < BSP_CAL_VERIFY_SAMPLES; ++j) {
+                            int32_t s;
+                            if (hx711_read_raw_blocking(&s, 200) != ESP_OK) continue;
+                            verify_sum_net += (int64_t)(s - s_tare_offset);
+                            verify_n++;
+                            /* Update raw/net cache only — NOT grams */
+                            int32_t cur_net = s - s_tare_offset;
+                            portENTER_CRITICAL(&s_cache_mux);
+                            s_latest_raw = s;
+                            s_latest_net = cur_net;
+                            portEXIT_CRITICAL(&s_cache_mux);
+                        }
+
+                        if (verify_n == 0) {
+                            ESP_LOGW(TAG, "CAL verification failed: zero fresh "
+                                          "samples — previous calibration preserved");
+                            buzzer_error();
+                        } else {
+                            float fresh_avg_net = (float)verify_sum_net / (float)verify_n;
+                            float measured      = fresh_avg_net / candidate;
+                            float err           = measured - known;
+                            if (fabsf(err) <= BSP_CAL_VERIFY_TOLERANCE_G) {
+                                /* PASS — install candidate, anchor filter,
+                                 * save NVS. */
+                                filter_reset(measured);
+                                portENTER_CRITICAL(&s_cache_mux);
+                                s_cal_factor   = candidate;
+                                s_cal_valid    = true;
+                                s_latest_grams = measured;
+                                s_stable       = true;
+                                portEXIT_CRITICAL(&s_cache_mux);
+                                ESP_LOGI(TAG, "CAL verification passed: "
+                                              "measured=%.2fg (target %.1f "
+                                              "±%.1fg, err %+.2fg)",
+                                         (double)measured, (double)known,
+                                         (double)BSP_CAL_VERIFY_TOLERANCE_G,
+                                         (double)err);
+                                ESP_LOGI(TAG, "CAL applied: factor=%.4f "
+                                              "counts/g, avg_net=%lld "
+                                              "span=%ld counts (avg of %d "
+                                              "samples, known=%.1fg)",
+                                         (double)candidate, (long long)avg_net,
+                                         (long)(net_max - net_min), n,
+                                         (double)known);
+                                /* H7: persist — only reached after all H9.3.2
+                                 * gates passed.  Bad windows never touch NVS. */
+                                (void)cal_save_to_nvs(candidate, known);
+                                /* H9.4: two-beep success only after the
+                                 * complete CAL+verify+NVS-save success
+                                 * path.  ANY rejection above buzzed error. */
+                                buzzer_success_cal();
+                            } else {
+                                ESP_LOGW(TAG, "CAL verification failed: "
+                                              "measured=%.2fg vs known=%.1fg "
+                                              "(err %+.2fg, tolerance ±%.1fg) "
+                                              "— previous calibration preserved",
+                                         (double)measured, (double)known,
+                                         (double)err,
+                                         (double)BSP_CAL_VERIFY_TOLERANCE_G);
+                                buzzer_error();
+                                /* s_cal_factor, s_cal_valid, NVS all untouched */
+                            }
+                        }
                     }
                 }
                 s_cal_in_progress = false;
                 serial_log_counter = 0;
+            cal_done: ;   /* H9.3.1: precheck-skip target */
             }
         }
 
@@ -813,8 +1093,25 @@ esp_err_t hx711_request_tare(void) {
         ESP_LOGW(TAG, "TARE ignored — already in progress");
         return ESP_ERR_INVALID_STATE;
     }
+
+    /* H9.3.1: the request-time stability precheck was REMOVED.  The
+     * screen is mechanically coupled to the load cell, so the finger
+     * pressure from the button tap was failing the precheck before the
+     * scale had a chance to settle.  Stability is now evaluated INSIDE
+     * the owner task AFTER hx711_settle has run, giving the finger
+     * BSP_TARE_SETTLE_MS to release. */
+
     xTaskNotify(s_owner_task, HX711_NOTIFY_TARE_BIT, eSetBits);
     return ESP_OK;
+}
+
+bool hx711_is_busy(void) {
+    /* H9.6: union of the three "currently doing something HX711-related"
+     * flags.  Each is a volatile bool single-writer (owner task) so
+     * stale reads from another task are harmless (worst case: caller
+     * sees not-busy briefly during the transition into TARE/CAL). */
+    return s_tare_in_progress || s_cal_in_progress
+           || s_boot_autotare_in_progress;
 }
 
 esp_err_t hx711_set_period_ms(uint32_t period_ms) {
@@ -842,7 +1139,32 @@ esp_err_t hx711_request_calibrate(float known_grams) {
         ESP_LOGW(TAG, "CAL ignored — already in progress");
         return ESP_ERR_INVALID_STATE;
     }
-    s_cal_known_grams = known_grams;   /* atomic 32-bit store on ESP32-S3 */
+
+    /* H9.3: cooldown — reject rapid repeat requests regardless of
+     * accept/reject of the previous one.  Timestamp set unconditionally
+     * at the END of this function so a precheck rejection still arms it. */
+    int64_t now = esp_timer_get_time();
+    if (s_last_cal_request_us > 0 &&
+        (now - s_last_cal_request_us) < (int64_t)BSP_CAL_COOLDOWN_MS * 1000) {
+        int64_t remain_ms = (int64_t)BSP_CAL_COOLDOWN_MS
+                            - (now - s_last_cal_request_us) / 1000;
+        ESP_LOGW(TAG, "CAL ignored — cooldown active (%lld ms remain)",
+                 (long long)remain_ms);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* H9.3.1: request-time stability/grams prechecks have been REMOVED.
+     * Reason: the screen is mechanically coupled to the load cell, so
+     * the finger pressure from the CAL-button tap caused the scale to
+     * be transiently unstable AT REQUEST TIME — the precheck rejected
+     * legitimate CAL attempts that would have been fine 200-500 ms
+     * later.  Both checks now run inside the owner task AFTER
+     * hx711_settle has waited BSP_CAL_SETTLE_MS for the finger to
+     * release.  The cooldown above still fires at request time (it's
+     * about user behavior, not physical state). */
+
+    s_last_cal_request_us = now;          /* arm cooldown */
+    s_cal_known_grams     = known_grams;  /* atomic 32-bit store on ESP32-S3 */
     xTaskNotify(s_owner_task, HX711_NOTIFY_CAL_BIT, eSetBits);
     return ESP_OK;
 }

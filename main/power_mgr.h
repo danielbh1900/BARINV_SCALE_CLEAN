@@ -30,6 +30,19 @@ void power_mgr_register_activity(void);
 // True iff currently in SOFT_STANDBY.  Cheap atomic read.
 bool power_mgr_is_standby(void);
 
+// H9.6: blanket lockout of UI actions immediately after a wake from
+// SOFT_STANDBY.  Returns TRUE for BSP_WAKE_TOUCH_GUARD_MS after the
+// most recent SOFT_STANDBY → ACTIVE transition.  Unlike
+// power_mgr_consume_wake_tap(), this does NOT consume the timestamp
+// — multiple checks during the window all return TRUE.  UI button
+// CLICKED handlers should call this FIRST and early-return on TRUE.
+//
+// Replaces the H9.0.1 single-shot consume pattern, which had a race
+// where multiple click events from a single touch (LVGL sometimes
+// dispatches two CLICKEDs ~100 ms apart for a sustained press) could
+// leak through after the first consume cleared the flag.
+bool power_mgr_ui_actions_blocked(void);
+
 // H9.0.1: check-and-consume the wake-tap flag.
 //   * Returns TRUE if the system just transitioned from SOFT_STANDBY
 //     to ACTIVE within the last BSP_WAKE_TAP_WINDOW_MS milliseconds

@@ -33,6 +33,7 @@
 #include "hx711.h"
 #include "board_config.h"
 #include "power_mgr.h"      /* H9.0: soft-standby */
+#include "buzzer.h"         /* H9.4: TARE/CAL audio feedback */
 
 static const char *TAG = "barinv";
 
@@ -56,6 +57,12 @@ void app_main(void) {
     ESP_ERROR_CHECK(bsp_i2c_init());
     ESP_ERROR_CHECK(bsp_tca9554_init());
     ESP_LOGI(TAG, "[1/6] I2C + TCA9554 ready");
+
+    /* H9.4: buzzer (TCA9554 EXIO8).  Safe to call right after the
+     * expander is up — buzzer_init only writes one "silent" byte and
+     * spawns its own queue+task.  Soft-fail (no ESP_ERROR_CHECK) so
+     * a queue alloc failure can't brick the boot. */
+    (void)buzzer_init();
 
     // ---- Backlight LEDC (off; turned on after panel is up) ---------------
     ESP_ERROR_CHECK(bsp_backlight_init());

@@ -93,8 +93,16 @@
 #define BSP_SD_PIN_CLK               2     // shared with ST7701 init CLK
 #define BSP_SD_CS_VIA_EXIO_BIT       4     // EXIO4 controls SD CS
 
-// ---- Buzzer (LATER; on/off only via TCA9554 EXIO8) ------------------------
+// ---- Buzzer (TCA9554 EXIO8, on/off active buzzer) -------------------------
 #define BSP_BUZZER_VIA_EXIO_BIT      8
+
+// H9.4: enable/disable the buzzer feedback module at build time.
+// Set 0 to compile-out all buzzer code (the buzzer_*() API becomes
+// no-ops returning ESP_OK).  Pin is fixed by hardware on TCA9554
+// EXIO8 — no GPIO guessing required.
+#ifndef BSP_BUZZER_ENABLE
+#define BSP_BUZZER_ENABLE            1
+#endif
 
 // ---- HX711 24-bit ADC (Phase 2; bit-bang via GPIO, no SPI peripheral) -----
 //  Console is on native USB-Serial-JTAG (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y,
@@ -128,11 +136,15 @@
 // on the TARE / CAL button briefly biases the reading.  The owner task
 // reads-and-discards for this many milliseconds (keeping the cache live
 // so the UI doesn't freeze) before starting the actual averaging window.
+// H9.3.2: bumped from 1200 → 3000 ms.  Field testing showed 1.2 s was
+// insufficient to absorb finger pressure on this assembly — the
+// post-settle stability flag was still in transition when prechecks
+// ran.  3 s is a commercial-scale-grade settle window.
 #ifndef BSP_TARE_SETTLE_MS
-#define BSP_TARE_SETTLE_MS           1000
+#define BSP_TARE_SETTLE_MS           3000
 #endif
 #ifndef BSP_CAL_SETTLE_MS
-#define BSP_CAL_SETTLE_MS            1000
+#define BSP_CAL_SETTLE_MS            3000
 #endif
 
 // H7.1: boot auto-tare.  Mirrors commercial kitchen-scale behavior — the
@@ -196,11 +208,151 @@
 // finger still on screen, weight sliding, etc.).  Span is computed in
 // raw HX711 counts so the same number works whether calibration exists
 // or not.  Previous tare/cal state is preserved on rejection.
+// H9.3: tightened from prior H8.1 values (3000 / 5000) after field tests
+// showed cal_factor drift across repeated CAL attempts on physically
+// unstable conditions.  Tighter span guards reject those windows before
+// they can overwrite a good NVS calibration.
 #ifndef BSP_TARE_MAX_SPAN_COUNTS
-#define BSP_TARE_MAX_SPAN_COUNTS     3000
+#define BSP_TARE_MAX_SPAN_COUNTS     1500   /* was 3000 in H8.1 */
 #endif
 #ifndef BSP_CAL_MAX_SPAN_COUNTS
-#define BSP_CAL_MAX_SPAN_COUNTS      5000
+#define BSP_CAL_MAX_SPAN_COUNTS      1500   /* was 5000 in H8.1 */
+#endif
+
+// H9.3: CAL request prechecks (run on the UI thread inside
+// hx711_request_calibrate, BEFORE the owner-task notification is
+// posted).  Cheap fast-fail layer in addition to the existing
+// post-collection span check.
+//
+//   * If calibration already exists, require the H8 stability flag
+//     and require |current_grams - known_grams| <= known_grams *
+//     BSP_CAL_TOLERANCE_FRACTION.  For known=500 g, 10 % == ±50 g, so
+//     CAL is accepted only if the live reading is between 450 g and
+//     550 g — protects against "user tapped CAL with nothing on the
+//     pan" overwriting NVS with a bogus factor.
+//   * If no calibration yet (initial setup), no precheck — the
+//     post-collection span guard is the only protection during the
+//     first CAL.
+//   * BSP_CAL_COOLDOWN_MS rejects repeat CAL taps for that long after
+//     ANY request (accepted or rejected) — prevents NVS hammering
+//     from a stuck button or impatient user.
+#ifndef BSP_CAL_TOLERANCE_FRACTION
+#define BSP_CAL_TOLERANCE_FRACTION   0.10f
+#endif
+#ifndef BSP_CAL_COOLDOWN_MS
+#define BSP_CAL_COOLDOWN_MS          5000   /* H9.3.2: was 3000 */
+#endif
+
+// H9.3.2: stability-hold gate.  After the per-settle precheck passes,
+// the owner task takes BSP_ACTION_STABLE_HOLD_SAMPLES fresh raw reads
+// in a row.  All must succeed, and (max-min) must be ≤
+// BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS.  Catches "transiently
+// stable, drifting underneath" conditions that a single-snapshot
+// precheck would let through.  Raw counts (not grams) because raw is
+// meaningful even when uncalibrated.
+#ifndef BSP_ACTION_STABLE_HOLD_SAMPLES
+#define BSP_ACTION_STABLE_HOLD_SAMPLES         5
+#endif
+#ifndef BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS
+#define BSP_ACTION_STABLE_HOLD_MAX_DRIFT_COUNTS  300
+#endif
+
+// H9.3.2: post-CAL verification.  After collection + span pass, the
+// owner task computes the candidate factor (avg_net / known) but does
+// NOT install it yet.  It takes BSP_CAL_VERIFY_SAMPLES fresh raw reads,
+// averages their net, divides by candidate to predict grams, and only
+// installs + saves NVS if |predicted - known| ≤ BSP_CAL_VERIFY_TOLERANCE_G.
+// Catches "load shifted off the platform during collection" and
+// "candidate factor produces nonsense numbers" failure modes.
+#ifndef BSP_CAL_VERIFY_SAMPLES
+#define BSP_CAL_VERIFY_SAMPLES                4
+#endif
+#ifndef BSP_CAL_VERIFY_TOLERANCE_G
+#define BSP_CAL_VERIFY_TOLERANCE_G          5.0f
+#endif
+
+// H9.5: display-only zero-lock with hysteresis.  When calibrated and
+// the H8 STABLE flag is true and |filtered grams| <= BSP_DISPLAY_ZERO_LOCK_G,
+// the UI displays exactly "0 g" until |grams| exceeds
+// BSP_DISPLAY_ZERO_RELEASE_G.  No internal state is modified — tare
+// offset, cal factor, snapshot grams, NVS all untouched.  Pure UI
+// smoothing to eliminate the visible ±2-5 g flicker near zero on
+// mechanically-noisy assemblies.
+#ifndef BSP_DISPLAY_ZERO_LOCK_ENABLE
+#define BSP_DISPLAY_ZERO_LOCK_ENABLE      1
+#endif
+#ifndef BSP_DISPLAY_ZERO_LOCK_G
+#define BSP_DISPLAY_ZERO_LOCK_G           5.0f
+#endif
+#ifndef BSP_DISPLAY_ZERO_RELEASE_G
+#define BSP_DISPLAY_ZERO_RELEASE_G        8.0f
+#endif
+/* Reserved for future "near-stable hold" display hint; not used by H9.5. */
+#ifndef BSP_DISPLAY_STABLE_HOLD_G
+#define BSP_DISPLAY_STABLE_HOLD_G         3.0f
+#endif
+
+// H9.5: CAL factor sanity warnings (informational only — DO NOT REJECT).
+// When the candidate factor differs from the previously-saved factor
+// by more than these fractions, log a warning so the user can see the
+// jump in the serial output.  The verification pass remains the
+// only hard gate for accepting/rejecting candidate factors.
+#ifndef BSP_CAL_FACTOR_DRIFT_WARN_FRACTION
+#define BSP_CAL_FACTOR_DRIFT_WARN_FRACTION    0.30f
+#endif
+#ifndef BSP_CAL_FACTOR_DRIFT_STRONG_FRACTION
+#define BSP_CAL_FACTOR_DRIFT_STRONG_FRACTION  0.80f
+#endif
+
+// H9.6 — power-mgr weight-activity tracking.  Each idle-check tick,
+// power_mgr compares the current filtered grams to the value it saw on
+// the previous tick.  A delta > BSP_POWER_WEIGHT_ACTIVITY_DELTA_G is
+// treated as user activity and arms a hold timer; standby is blocked
+// for BSP_POWER_ACTIVITY_HOLD_MS after the most recent weight change.
+// Catches "user just put / removed a 500 g item, walked away briefly".
+#ifndef BSP_POWER_WEIGHT_ACTIVITY_DELTA_G
+#define BSP_POWER_WEIGHT_ACTIVITY_DELTA_G   10.0f
+#endif
+#ifndef BSP_POWER_ACTIVITY_HOLD_MS
+#define BSP_POWER_ACTIVITY_HOLD_MS          30000
+#endif
+
+// H9.6 — wake-touch guard window.  After SOFT_STANDBY → ACTIVE,
+// power_mgr_ui_actions_blocked() returns TRUE for this many ms.  UI
+// button CLICKED handlers check this FIRST and early-return when
+// true.  Unlike consume_wake_tap (single-shot), this is a
+// non-consuming gate so multiple click events during the window all
+// block — covers the case where LVGL dispatches the CLICKED event a
+// few hundred ms after the touch INT fires.
+#ifndef BSP_WAKE_TOUCH_GUARD_MS
+#define BSP_WAKE_TOUCH_GUARD_MS             1000
+#endif
+
+// H9.6 — TARE empty-safe gate (after settle, before sample collection).
+// When calibrated, refuse to TARE if |filtered grams| exceeds
+// BSP_TARE_EMPTY_LIMIT_G.  Prevents the failure mode where a stray
+// touch on the TARE button (including a wake-touch leak that escapes
+// the wake-touch guard) accidentally zeroes a 500 g reading.  A
+// future container-tare mode would be a separate explicit feature.
+#ifndef BSP_TARE_REQUIRE_EMPTY
+#define BSP_TARE_REQUIRE_EMPTY              1
+#endif
+#ifndef BSP_TARE_EMPTY_LIMIT_G
+#define BSP_TARE_EMPTY_LIMIT_G              10.0f
+#endif
+
+// H9.7 — scale display range.
+//   * BSP_SCALE_MAX_DISPLAY_G  — informational soft cap (3 kg today —
+//     practical max for typical bottle weighing).  No behavior change
+//     at this threshold; here for future warning UI.
+//   * BSP_SCALE_OVERLOAD_G    — hard cap.  |display_grams| above this
+//     shows "OVER" instead of a number — prevents nonsense readings
+//     from cell saturation.
+#ifndef BSP_SCALE_MAX_DISPLAY_G
+#define BSP_SCALE_MAX_DISPLAY_G            3000.0f
+#endif
+#ifndef BSP_SCALE_OVERLOAD_G
+#define BSP_SCALE_OVERLOAD_G               3500.0f
 #endif
 
 // H9.0: soft-standby (display-off) idle timing.

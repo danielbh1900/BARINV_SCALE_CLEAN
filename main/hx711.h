@@ -106,6 +106,13 @@ esp_err_t hx711_request_calibrate(float known_grams);
 //   net  := raw - tare_offset  (== raw before the first TARE)
 bool hx711_get_snapshot(int32_t *out_raw, int32_t *out_net);
 
+// H9.6 — query whether the owner task is currently inside a TARE,
+// CAL, or boot-auto-tare collection.  Read-only — touches no
+// hardware.  power_mgr uses this to block SOFT_STANDBY transitions
+// while a calibration action is in progress.  Thread-safe: reads
+// volatile flags.
+bool hx711_is_busy(void);
+
 // H9.1 (safe rev) — power-managed inter-sample period.
 //   Called only by power_mgr on SOFT_STANDBY transitions.  Updates a
 //   volatile uint32_t that the owner task reads once per loop iteration
