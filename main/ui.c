@@ -45,13 +45,17 @@ static lv_obj_t *s_raw_lbl    = NULL;
 
 static void on_tare_clicked(lv_event_t *e) {
     (void)e;
+    /* H9.7.1: unconditional "touch event received" log — fires BEFORE
+     * any guard.  Lets us distinguish "button didn't register" from
+     * "button registered but was blocked" in field diagnostics. */
+    ESP_LOGI(TAG, "TARE TOUCH EVENT RECEIVED");
     /* H9.6: blanket wake-touch guard — non-consuming, covers multiple
      * click events during BSP_WAKE_TOUCH_GUARD_MS.  Replaces the
      * H9.0.1 consume_wake_tap that could leak when LVGL fired two
      * CLICKEDs from one sustained touch.  Checked FIRST so a wake-tap
      * landing on TARE never zeroes the scale. */
     if (power_mgr_ui_actions_blocked()) {
-        ESP_LOGI(TAG, "TARE: UI action blocked — wake touch consumed");
+        ESP_LOGI(TAG, "TARE blocked by wake guard");
         return;
     }
     /* H9.4: short chirp acknowledges the button press (does NOT
@@ -71,9 +75,11 @@ static void on_tare_clicked(lv_event_t *e) {
 
 static void on_cal_clicked(lv_event_t *e) {
     (void)e;
+    /* H9.7.1: unconditional log BEFORE any guard. */
+    ESP_LOGI(TAG, "CAL TOUCH EVENT RECEIVED");
     /* H9.6: blanket wake-touch guard (see TARE handler comment). */
     if (power_mgr_ui_actions_blocked()) {
-        ESP_LOGI(TAG, "CAL: UI action blocked — wake touch consumed");
+        ESP_LOGI(TAG, "CAL blocked by wake guard");
         return;
     }
     /* H9.4: tap acknowledgement chirp (see TARE handler comment). */
@@ -162,8 +168,11 @@ static void ui_poll_raw_cb(lv_timer_t *t) {
      * decimal split with integer math and use "%s%ld.%03ld" so the
      * output is identical regardless of LVGL's printf configuration. */
     if (!cal_valid) {
-        lv_label_set_text(s_weight_lbl, "----");
-        lv_label_set_text(s_unit_lbl,   "g");
+        /* H9.7.1: live raw count in the big display instead of "----"
+         * — proves the HX711 is alive and lets the user watch counts
+         * settle as they place the 500 g weight before tapping CAL. */
+        lv_label_set_text_fmt(s_weight_lbl, "%ld", (long)raw);
+        lv_label_set_text(s_unit_lbl, "raw");
     } else if (isnan(display_grams) || isinf(display_grams)) {
         /* Defensive — shouldn't happen since cal_factor is checked for
          * zero on NVS load.  Logged once per 5 s if it ever does. */
@@ -219,13 +228,18 @@ static void ui_poll_raw_cb(lv_timer_t *t) {
         }
     }
 
-    /* H8 + H9.5: stability/zero indicator.  Hidden ("---" gray) until
-     * calibration is loaded.  Green "ZERO" when display zero-lock is
-     * active (calibrated, stable, near zero).  Green "STABLE" when
-     * calibrated + stable but not near zero.  Otherwise "---". */
+    /* H8 + H9.5 + H9.7.1: stability/zero/help indicator.
+     *   uncalibrated → amber "PUT 500g + TAP CAL" so a fresh-flash
+     *                  device tells the user EXACTLY what to do —
+     *                  combined with the live raw count in the big
+     *                  display, the user has full feedback that the
+     *                  scale is alive and waiting for calibration.
+     *   zero-locked  → green "ZERO"
+     *   stable       → green "STABLE"
+     *   otherwise    → gray "---" */
     if (!cal_valid) {
-        lv_label_set_text(s_stable_lbl, "---");
-        lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0x808080), 0);
+        lv_label_set_text(s_stable_lbl, "PUT 500g + TAP CAL");
+        lv_obj_set_style_text_color(s_stable_lbl, lv_color_hex(0xFFA000), 0);
 #if BSP_DISPLAY_ZERO_LOCK_ENABLE
     } else if (s_zero_locked) {
         lv_label_set_text(s_stable_lbl, "ZERO");
