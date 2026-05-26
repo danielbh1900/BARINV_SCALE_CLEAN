@@ -212,7 +212,7 @@
 // The first wake-tap is consumed by the UI so it does not also trigger
 // a TARE or CAL action under the finger.
 #ifndef BSP_IDLE_TO_STANDBY_MS
-#define BSP_IDLE_TO_STANDBY_MS         30000
+#define BSP_IDLE_TO_STANDBY_MS        180000   /* H9.2: 3 min (was 30 s) */
 #endif
 #ifndef BSP_STANDBY_BACKLIGHT_DUTY
 #define BSP_STANDBY_BACKLIGHT_DUTY         0
@@ -262,4 +262,31 @@
 #endif
 #ifndef BSP_HX711_STANDBY_PERIOD_MS
 #define BSP_HX711_STANDBY_PERIOD_MS      1000
+#endif
+
+// H9.2: weight-aware standby.  power_mgr's idle check now reads the
+// HX711 filtered grams + stable flag from the public snapshot API
+// (it never touches HX711 hardware).  Default-deny: only enters
+// SOFT_STANDBY when ALL of these are true:
+//   * idle for at least BSP_IDLE_TO_STANDBY_MS
+//   * calibration is valid                       (else can't trust grams)
+//   * |filtered grams| <= BSP_STANDBY_EMPTY_THRESHOLD_G   (gated by
+//     BSP_STANDBY_REQUIRE_EMPTY — set 0 to disable the empty check)
+//   * stable flag is true                        (gated by
+//     BSP_STANDBY_BLOCK_IF_UNSTABLE — set 0 to disable)
+// When any condition fails, standby is blocked and a (30-s-throttled)
+// log line names the reason.  Re-checked at the existing 1 Hz idle
+// poll, so as soon as conditions clear (e.g. user removes weight),
+// standby fires within ~1 s.
+#ifndef BSP_STANDBY_REQUIRE_EMPTY
+#define BSP_STANDBY_REQUIRE_EMPTY            1
+#endif
+#ifndef BSP_STANDBY_EMPTY_THRESHOLD_G
+#define BSP_STANDBY_EMPTY_THRESHOLD_G     10.0f
+#endif
+#ifndef BSP_STANDBY_BLOCK_IF_UNSTABLE
+#define BSP_STANDBY_BLOCK_IF_UNSTABLE        1
+#endif
+#ifndef BSP_STANDBY_BLOCK_LOG_THROTTLE_MS
+#define BSP_STANDBY_BLOCK_LOG_THROTTLE_MS  30000
 #endif

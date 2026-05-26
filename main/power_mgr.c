@@ -15,11 +15,13 @@
 #include "board_config.h"
 #include "backlight.h"
 #include "hx711.h"          /* H9.1 (safe rev): rate change on standby edge */
+                            /* H9.2:           snapshot read for weight-aware */
 
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_timer.h"
+#include <math.h>           /* H9.2: fabsf */
 
 static const char *TAG = "power_mgr";
 
@@ -38,6 +40,12 @@ static esp_timer_handle_t   s_idle_timer         = NULL;
  * when ACTIVE — timer is stopped on wake and re-started on next sleep. */
 static esp_timer_handle_t   s_standby_poll_timer = NULL;
 
+/* H9.2: last time we logged "standby blocked — …" — used to throttle
+ * the block-reason log to BSP_STANDBY_BLOCK_LOG_THROTTLE_MS so a
+ * sustained block (e.g. weight sitting on the platform for an hour)
+ * doesn't fill the console. */
+static int64_t              s_last_block_log_us  = 0;
+
 /* H9.0.1: wake-tap window.  Set to esp_timer_get_time() on every
  * SOFT_STANDBY → ACTIVE transition.  power_mgr_consume_wake_tap()
  * checks (now - this) < BSP_WAKE_TAP_WINDOW_MS and consumes if so.
@@ -53,12 +61,15 @@ static void enter_soft_standby(void) {
      * picked up on the next loop iteration (≤ 100 ms here, since the
      * task was running at active rate immediately before this). */
     (void)hx711_set_period_ms(BSP_HX711_STANDBY_PERIOD_MS);
-    ESP_LOGI(TAG, "entering SOFT_STANDBY after %d ms idle "
-                  "(backlight duty -> %d; GPIO%d poll @ %d ms; "
+    ESP_LOGI(TAG, "entering SOFT_STANDBY after %d ms idle, empty stable "
+                  "platform (backlight duty -> %d; GPIO%d poll @ %d ms; "
                   "HX711 period -> %d ms)",
              BSP_IDLE_TO_STANDBY_MS, BSP_STANDBY_BACKLIGHT_DUTY,
              BSP_TOUCH_PIN_INT, BSP_STANDBY_INT_POLL_MS,
              BSP_HX711_STANDBY_PERIOD_MS);
+    /* H9.2: clear the block-log throttle so the next standby cycle
+     * (after wake) starts fresh. */
+    s_last_block_log_us = 0;
     /* H9.0.1: start the dedicated GPIO16 poll timer.  Safe to call
      * even if already running — esp_timer_start_periodic returns
      * ESP_ERR_INVALID_STATE which we ignore. */
@@ -97,15 +108,61 @@ static void exit_soft_standby(const char *reason) {
 }
 
 /* esp_timer task — runs every 1 s.  Keep work tiny here — no blocking,
- * no log spam unless transitioning. */
+ * no log spam unless transitioning.
+ *
+ * H9.2: default-deny standby gate.  Even when idle ≥ threshold, we only
+ * enter SOFT_STANDBY if the HX711 snapshot agrees that the platform is
+ * empty + stable + calibrated.  Read-only access via the public
+ * hx711_get_snapshot_full() — no GPIO/protocol calls into HX711. */
 static void idle_check_cb(void *arg) {
     (void)arg;
     if (s_state != PM_ACTIVE) return;
     int64_t now_us  = esp_timer_get_time();
     int64_t idle_ms = (now_us - s_last_activity_us) / 1000;
-    if (idle_ms >= (int64_t)BSP_IDLE_TO_STANDBY_MS) {
-        enter_soft_standby();
+    if (idle_ms < (int64_t)BSP_IDLE_TO_STANDBY_MS) return;
+
+    /* Idle threshold reached — evaluate weight-aware preconditions. */
+    bool        ok_to_standby = false;
+    const char *block_reason  = "no sample yet";
+    int32_t     raw           = 0;
+    int32_t     net           = 0;
+    float       grams         = 0.0f;
+    bool        cal_valid     = false;
+    bool        stable        = false;
+
+    if (hx711_get_snapshot_full(&raw, &net, &grams, &cal_valid, &stable)) {
+        if (!cal_valid) {
+            block_reason = "uncalibrated";
+        }
+#if BSP_STANDBY_REQUIRE_EMPTY
+        else if (fabsf(grams) > BSP_STANDBY_EMPTY_THRESHOLD_G) {
+            block_reason = "weight present";
+        }
+#endif
+#if BSP_STANDBY_BLOCK_IF_UNSTABLE
+        else if (!stable) {
+            block_reason = "scale unstable";
+        }
+#endif
+        else {
+            ok_to_standby = true;
+        }
     }
+
+    if (!ok_to_standby) {
+        if ((now_us - s_last_block_log_us)
+                > (int64_t)BSP_STANDBY_BLOCK_LOG_THROTTLE_MS * 1000) {
+            ESP_LOGI(TAG, "standby blocked — %s "
+                          "(grams=%.1f stable=%d cal_valid=%d, idle=%lld ms)",
+                     block_reason, (double)grams,
+                     (int)stable, (int)cal_valid, (long long)idle_ms);
+            s_last_block_log_us = now_us;
+        }
+        return;
+    }
+
+    /* All clear — proceed into soft standby. */
+    enter_soft_standby();
 }
 
 /* H9.0.1: standby-only GPIO16 poll.  Runs ONLY when SOFT_STANDBY is
